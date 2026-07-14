@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import uuid
 from typing import Any
 
@@ -667,10 +668,40 @@ def _create_techdraw_page(document: Any, arguments: dict[str, Any], plan_id: str
     suffix = uuid.uuid4().hex[:8]
     page = document.addObject("TechDraw::DrawPage", f"AgenticPage_{suffix}")
     page.Label = arguments.get("label") or "Agentic Drawing Page"
+    template = document.addObject("TechDraw::DrawSVGTemplate", f"AgenticTemplate_{suffix}")
+    template.Label = f"{page.Label} Template"
+    template.Template = _techdraw_template_path(arguments)
+    page.Template = template
     if "scale" in arguments:
         page.Scale = float(arguments["scale"])
     _attach_agent_metadata(page, f"agentic-techdraw-page-{suffix}", plan_id)
+    _attach_agent_metadata(template, f"agentic-techdraw-template-{suffix}", plan_id)
     return page
+
+
+def _techdraw_template_path(arguments: dict[str, Any]) -> str:
+    import FreeCAD  # type: ignore
+
+    explicit_path = arguments.get("template_path")
+    if explicit_path:
+        template_path = str(explicit_path)
+    else:
+        resource_dir_getter = getattr(FreeCAD, "getResourceDir", None)
+        resource_dir = str(resource_dir_getter() if callable(resource_dir_getter) else "")
+        if not resource_dir:
+            return "Default_Template_A4_Landscape.svg"
+        template_path = os.path.join(
+            resource_dir,
+            "Mod",
+            "TechDraw",
+            "Templates",
+            "Default_Template_A4_Landscape.svg",
+        )
+    if not template_path.endswith(".svg"):
+        raise ValueError("TechDraw template_path must point to an SVG template")
+    if os.path.isabs(template_path) and not os.path.exists(template_path):
+        raise FileNotFoundError(f"TechDraw template was not found: {template_path}")
+    return template_path
 
 
 def _techdraw_page_target(document: Any, stable_id: str) -> Any:
