@@ -1,9 +1,9 @@
-"""Run the CAD agent loop inside the FreeCAD plugin process."""
+"""Thin FreeCAD plugin adapter for the service-side CAD agent loop."""
 
 from __future__ import annotations
 
 import json
-import uuid
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -30,80 +30,19 @@ def run_approved_local_agent_loop(
     fail-closed stage promotion record via `promotion_evidence`.
     """
     repo_root = _repo_root()
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-
-    from backend.orchestration.agent_execution_loop import (
-        AgentPlan,
-        AgentPlanStatus,
-        CADAgentExecutionLoop,
-        default_freecad_agent_registry,
-        pass_if_all_tools_ok,
-    )
-    from backend.orchestration.cad_agent_harness import (
-        DesignStage,
-        EpisodeTrace,
-        TaskContract,
-        ToolCall,
-        ToolResult,
-    )
-    from backend.orchestration.freecad_planner import build_freecad_plan
-
+    service = _agent_loop_service(repo_root)
     context = get_document_context()
     capabilities = list_capabilities()
-    trace = EpisodeTrace(f"freecad-local-agent-{uuid.uuid4().hex[:8]}")
-    loop = CADAgentExecutionLoop(default_freecad_agent_registry(capabilities), trace=trace)
-    contract = TaskContract(
-        task_id=trace.task_id,
-        goal=prompt,
-        artifact_kind="freecad_document",
-        source_refs=[],
-        approval_gates=[],
-        max_iterations=3,
-        stage=DesignStage(stage),
-        scratch_document=bool(scratch_document),
+    payload = service.run_local_freecad_agent_loop(
+        prompt,
+        context=context,
+        capabilities=capabilities,
+        execute_operation=_execute_native_operation,
+        stage=stage,
+        scratch_document=scratch_document,
         promotion_evidence=promotion_evidence,
+        llm_planner=llm_planner,
     )
-
-    def planner(_loop_context):
-        plan = build_freecad_plan(
-            prompt, context=context, capabilities=capabilities, llm_planner=llm_planner
-        )
-        if plan.get("status") == "needs_clarification":
-            return AgentPlan(
-                status=AgentPlanStatus.NEEDS_USER_INPUT,
-                questions=[str(item) for item in plan.get("questions", [])],
-                explanation=str(plan.get("explanation") or ""),
-            )
-        calls = []
-        for operation in plan.get("operations", []):
-            arguments = dict(operation.get("arguments") or {})
-            arguments["_operation_type"] = operation.get("type")
-            if operation.get("alias"):
-                arguments["_alias"] = operation["alias"]
-            if "target" in operation:
-                arguments["target"] = operation["target"]
-            calls.append(
-                ToolCall(
-                    tool_name=str(operation.get("type")),
-                    arguments=arguments,
-                    reason=str(plan.get("explanation") or "Execute typed FreeCAD operation."),
-                )
-            )
-        return AgentPlan(
-            status=AgentPlanStatus.READY,
-            tool_calls=calls,
-            explanation=str(plan.get("explanation") or ""),
-        )
-
-    report = loop.run(
-        contract,
-        planner,
-        _native_tool_implementations(),
-        pass_if_all_tools_ok,
-        approval_provider=lambda *_args: True,
-    )
-    payload = report.as_dict()
     if persist_report:
         payload["report_path"] = str(save_agent_loop_report(payload, document_context=context, repo_root=repo_root))
     return payload
@@ -128,59 +67,26 @@ def save_agent_loop_report(
     return destination
 
 
-ALIAS_REF_PREFIX = "@alias:"
-
-
 def _native_tool_implementations():
-    aliases: dict[str, str] = {}
-
-    def _implementation(arguments: dict[str, Any]) -> Any:
-        return _execute_single_operation(arguments, aliases)
-
-    return {str(item["name"]): _implementation for item in list_capabilities()}
-
-
-def _resolve_alias_reference(value: Any, aliases: dict[str, str]) -> Any:
-    if isinstance(value, str) and value.startswith(ALIAS_REF_PREFIX):
-        name = value[len(ALIAS_REF_PREFIX) :]
-        if name not in aliases:
-            raise ValueError(f"Alias is referenced before it is created: {name}")
-        return aliases[name]
-    return value
+    service = _agent_loop_service(_repo_root())
+    return service.build_native_tool_implementations(list_capabilities(), _execute_native_operation)
 
 
 def _execute_single_operation(arguments: dict[str, Any], aliases: dict[str, str] | None = None) -> Any:
-    from backend.orchestration.cad_agent_harness import ToolResult
+    service = _agent_loop_service(_repo_root())
+    return service.execute_single_operation(arguments, _execute_native_operation, aliases=aliases)
 
-    aliases = {} if aliases is None else aliases
-    payload = dict(arguments)
-    operation_type = str(payload.pop("_operation_type"))
-    alias = payload.pop("_alias", None)
-    target = payload.pop("target", None)
-    if "body_target" in payload:
-        payload["body_target"] = _resolve_alias_reference(payload["body_target"], aliases)
-    operation = {
-        "type": operation_type,
-        "arguments": payload,
-    }
-    if target is not None:
-        operation["target"] = _resolve_alias_reference(target, aliases)
-    result = execute_plan(
+
+def _execute_native_operation(operation: dict[str, Any]) -> dict[str, Any]:
+    return execute_plan(
         {
             "schema_version": "freecad_tool_plan.v0",
-            "plan_id": f"local_agent_{uuid.uuid4().hex[:12]}",
+            "plan_id": f"local_agent_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
             "status": "ready",
             "operations": [operation],
         },
         approved=True,
     )
-    if alias:
-        changed = result.get("changed") or []
-        stable_id = changed[0].get("stable_id") if changed else None
-        if not stable_id:
-            raise ValueError(f"Aliased operation returned no stable_id: {alias}")
-        aliases[str(alias)] = str(stable_id)
-    return ToolResult(ok=True, output=result)
 
 
 def _episode_dir(document_context: dict[str, Any], *, repo_root: Path) -> Path:
@@ -206,8 +112,34 @@ def _safe_name(value: str) -> str:
 
 
 def _repo_root() -> Path:
+    for candidate in _repo_root_candidates():
+        if (candidate / "backend" / "orchestration" / "agent_execution_loop.py").is_file():
+            return candidate
+    raise FileNotFoundError("agentic-cad repo root was not found")
+
+
+def _repo_root_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_root = os.environ.get("AGENTIC_CAD_SERVICE_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser().resolve())
     for start in (Path(__file__).resolve(), Path.cwd().resolve()):
         for parent in (start, *start.parents):
-            if (parent / "backend" / "orchestration" / "agent_execution_loop.py").is_file():
-                return parent
-    raise FileNotFoundError("agentic-cad repo root was not found")
+            candidates.append(parent)
+            candidates.append(parent / "ai-agentic-cad")
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def _agent_loop_service(repo_root: Path):
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from backend.freecad_bridge import local_agent_loop_service
+
+    return local_agent_loop_service

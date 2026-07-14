@@ -275,6 +275,17 @@ def _ensure_sketcher_registered() -> None:
     import Sketcher  # type: ignore  # noqa: F401
 
 
+def _ensure_partdesign_registered() -> None:
+    """Load the PartDesign module so FreeCADCmd registers PartDesign object types."""
+    try:
+        import _PartDesign  # type: ignore  # noqa: F401
+    except ImportError:
+        try:
+            import PartDesign  # type: ignore  # noqa: F401
+        except ImportError:
+            return
+
+
 def _create_sketch(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
     _ensure_sketcher_registered()
     suffix = uuid.uuid4().hex[:8]
@@ -443,6 +454,7 @@ def _add_sketch_constraints(document: Any, operation: dict[str, Any]) -> tuple[A
 
 
 def _create_partdesign_body(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    _ensure_partdesign_registered()
     suffix = uuid.uuid4().hex[:8]
     body = document.addObject("PartDesign::Body", f"AgenticBody_{suffix}")
     body.Label = arguments.get("label") or "Agentic Body"
