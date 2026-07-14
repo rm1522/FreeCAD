@@ -6,11 +6,21 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-import sys
 from typing import Any
 
 from services.capability_registry import list_capabilities
+from services.local_agent_service_client import LocalAgentServiceSession
 from services.native_tools import execute_plan, get_document_context
+
+
+ALLOWED_DESIGN_STAGES = {"s0_envelope", "s1_structure", "s2_features", "s3_engineering"}
+
+
+class _ToolResult:
+    def __init__(self, ok: bool, output: Any = None, error: str | None = None):
+        self.ok = ok
+        self.output = output
+        self.error = error
 
 
 def run_approved_local_agent_loop(
@@ -29,20 +39,25 @@ def run_approved_local_agent_loop(
     promoting a scratch draft into `s3_engineering`) requires the matching
     fail-closed stage promotion record via `promotion_evidence`.
     """
+    if stage not in ALLOWED_DESIGN_STAGES:
+        raise ValueError(f"Unknown design stage: {stage}")
+    if llm_planner is not None:
+        raise ValueError("llm_planner objects must run inside the external agent service")
     repo_root = _repo_root()
-    service = _agent_loop_service(repo_root)
     context = get_document_context()
     capabilities = list_capabilities()
-    payload = service.run_local_freecad_agent_loop(
-        prompt,
-        context=context,
-        capabilities=capabilities,
-        execute_operation=_execute_native_operation,
-        stage=stage,
-        scratch_document=scratch_document,
-        promotion_evidence=promotion_evidence,
-        llm_planner=llm_planner,
-    )
+    with LocalAgentServiceSession(repo_root) as client:
+        service_payload = client.plan_freecad_agent_episode(
+            {
+                "prompt": prompt,
+                "document_context": context,
+                "capabilities": capabilities,
+                "stage": stage,
+                "scratch_document": scratch_document,
+                "promotion_evidence": promotion_evidence,
+            }
+        )
+    payload = _execute_service_plan(service_payload)
     if persist_report:
         payload["report_path"] = str(save_agent_loop_report(payload, document_context=context, repo_root=repo_root))
     return payload
@@ -68,13 +83,81 @@ def save_agent_loop_report(
 
 
 def _native_tool_implementations():
-    service = _agent_loop_service(_repo_root())
-    return service.build_native_tool_implementations(list_capabilities(), _execute_native_operation)
+    aliases: dict[str, str] = {}
+
+    def _implementation(arguments: dict[str, Any]) -> _ToolResult:
+        return _execute_single_operation(arguments, aliases)
+
+    return {str(item["name"]): _implementation for item in list_capabilities()}
 
 
 def _execute_single_operation(arguments: dict[str, Any], aliases: dict[str, str] | None = None) -> Any:
-    service = _agent_loop_service(_repo_root())
-    return service.execute_single_operation(arguments, _execute_native_operation, aliases=aliases)
+    aliases = {} if aliases is None else aliases
+    payload = dict(arguments)
+    operation_type = str(payload.pop("_operation_type"))
+    alias = payload.pop("_alias", None)
+    target = payload.pop("target", None)
+    if "body_target" in payload:
+        payload["body_target"] = _resolve_alias_reference(payload["body_target"], aliases)
+    operation = {
+        "type": operation_type,
+        "arguments": payload,
+    }
+    if target is not None:
+        operation["target"] = _resolve_alias_reference(target, aliases)
+    result = _execute_native_operation(operation)
+    if alias:
+        changed = result.get("changed") or []
+        stable_id = changed[0].get("stable_id") if changed else None
+        if not stable_id:
+            raise ValueError(f"Aliased operation returned no stable_id: {alias}")
+        aliases[str(alias)] = str(stable_id)
+    return _ToolResult(ok=True, output=result)
+
+
+def _execute_service_plan(service_payload: dict[str, Any]) -> dict[str, Any]:
+    status = service_payload.get("status")
+    task_id = str(service_payload.get("task_id") or "freecad-local-agent")
+    trace_events = list(service_payload.get("trace_events") or [])
+    if status == "needs_user_input":
+        return {
+            "schema_version": "cad_agent_loop_report.v1",
+            "status": "needs_user_input",
+            "task_id": task_id,
+            "artifact_kind": "freecad_document",
+            "iterations": 1,
+            "questions": service_payload.get("questions") or [],
+            "error": None,
+            "tool_results": [],
+            "verification": None,
+            "trace_events": trace_events,
+        }
+    if status != "ready":
+        return {
+            "schema_version": "cad_agent_loop_report.v1",
+            "status": "rejected",
+            "task_id": task_id,
+            "artifact_kind": "freecad_document",
+            "iterations": 1,
+            "questions": [],
+            "error": service_payload.get("error") or "agent_service_rejected",
+            "tool_results": [],
+            "verification": None,
+            "trace_events": trace_events,
+        }
+    result = execute_plan(service_payload["plan"], approved=True)
+    return {
+        "schema_version": "cad_agent_loop_report.v1",
+        "status": "committed",
+        "task_id": task_id,
+        "artifact_kind": "freecad_document",
+        "iterations": 1,
+        "questions": [],
+        "error": None,
+        "tool_results": [{"ok": True, "output": result, "error": None}],
+        "verification": {"status": "pass", "summary": "all tool calls succeeded"},
+        "trace_events": trace_events + [{"event": "agent_ipc_plan_executed"}],
+    }
 
 
 def _execute_native_operation(operation: dict[str, Any]) -> dict[str, Any]:
@@ -87,6 +170,18 @@ def _execute_native_operation(operation: dict[str, Any]) -> dict[str, Any]:
         },
         approved=True,
     )
+
+
+ALIAS_REF_PREFIX = "@alias:"
+
+
+def _resolve_alias_reference(value: Any, aliases: dict[str, str]) -> Any:
+    if isinstance(value, str) and value.startswith(ALIAS_REF_PREFIX):
+        name = value[len(ALIAS_REF_PREFIX) :]
+        if name not in aliases:
+            raise ValueError(f"Alias is referenced before it is created: {name}")
+        return aliases[name]
+    return value
 
 
 def _episode_dir(document_context: dict[str, Any], *, repo_root: Path) -> Path:
@@ -135,11 +230,3 @@ def _repo_root_candidates() -> list[Path]:
         seen.add(candidate)
         unique.append(candidate)
     return unique
-
-
-def _agent_loop_service(repo_root: Path):
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    from backend.freecad_bridge import local_agent_loop_service
-
-    return local_agent_loop_service
