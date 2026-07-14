@@ -6,6 +6,8 @@ file(GLOB_RECURSE Agentic_SRCS
     *.xml
 )
 
+ADD_CUSTOM_TARGET(Agentic ALL SOURCES ${Agentic_SRCS})
+
 fc_copy_sources(Agentic "${CMAKE_BINARY_DIR}/Mod/Agentic" ${Agentic_SRCS})
 
 INSTALL(
