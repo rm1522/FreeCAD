@@ -1,0 +1,1059 @@
+"""Execute allow-listed typed operations inside a FreeCAD document transaction."""
+
+from __future__ import annotations
+
+import math
+import uuid
+from typing import Any
+
+from services.capability_registry import CAPABILITIES
+
+
+ALLOWED_OPERATIONS = {str(item["name"]) for item in CAPABILITIES}
+MUTATING_OPERATIONS = {
+    str(item["name"]) for item in CAPABILITIES if bool(item.get("mutates_document"))
+}
+PARAMETER_PROPERTIES = {
+    "length": "Length",
+    "width": "Width",
+    "height": "Height",
+    "radius": "Radius",
+}
+MAX_TRANSLATION_MM = 1_000_000.0
+MAX_SKETCH_COORDINATE_MM = 1_000_000.0
+TARGET_REQUIRED_OPERATIONS = {
+    "object.update_parameters",
+    "object.translate",
+    "sketch.add_geometry",
+    "sketch.add_constraint",
+    "partdesign.pad",
+    "partdesign.pocket",
+    "partdesign.revolution",
+    "partdesign.hole",
+    "partdesign.fillet",
+    "partdesign.chamfer",
+    "partdesign.mirror",
+    "partdesign.linear_pattern",
+}
+REVOLUTION_AXES = {"v_axis": "V_Axis", "h_axis": "H_Axis"}
+PATTERN_AXES = {"x": "X_Axis", "y": "Y_Axis", "z": "Z_Axis"}
+MAX_PATTERN_OCCURRENCES = 64
+ALIAS_REF_PREFIX = "@alias:"
+CREATION_OPERATIONS = {
+    "primitive.create_box",
+    "primitive.create_cylinder",
+    "sketch.create",
+    "partdesign.create_body",
+    "partdesign.pad",
+    "partdesign.pocket",
+    "partdesign.revolution",
+    "partdesign.hole",
+    "partdesign.fillet",
+    "partdesign.chamfer",
+    "partdesign.mirror",
+    "partdesign.linear_pattern",
+}
+SKETCH_PLANE_NORMALS = {
+    "XY": (0.0, 0.0, 1.0),
+    "XZ": (0.0, -1.0, 0.0),
+    "YZ": (1.0, 0.0, 0.0),
+}
+SKETCH_PLANES = ("XY", "XZ", "YZ")
+SKETCH_POINT_CODES = {"start": 1, "end": 2, "center": 3}
+SKETCH_GEOMETRY_KINDS = ("line", "circle", "arc", "rectangle")
+SKETCH_CONSTRAINT_KINDS = (
+    "coincident",
+    "horizontal",
+    "vertical",
+    "distance",
+    "distance_x",
+    "distance_y",
+    "radius",
+    "diameter",
+    "angle",
+    "symmetric",
+)
+
+
+def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reject unknown or malformed operations before touching the document."""
+    if plan.get("schema_version") != "freecad_tool_plan.v0":
+        raise ValueError("Unsupported FreeCAD tool plan schema")
+    if plan.get("status") != "ready":
+        raise ValueError("Only ready plans can be executed")
+    operations = plan.get("operations")
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("The plan contains no operations")
+    declared_aliases: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise ValueError("Operation must be an object")
+        operation_type = operation.get("type")
+        if operation_type not in ALLOWED_OPERATIONS:
+            raise ValueError(f"Operation is not allow-listed: {operation_type}")
+        if operation_type in TARGET_REQUIRED_OPERATIONS and not operation.get("target"):
+            raise ValueError(f"Operation target is required: {operation_type}")
+        arguments = operation.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            raise ValueError("Operation arguments must be an object")
+        _validate_operation_alias(operation, operation_type, arguments, declared_aliases)
+        if operation_type == "sketch.create" and arguments.get("plane") not in SKETCH_PLANES:
+            raise ValueError(f"Sketch plane must be one of {SKETCH_PLANES}")
+        if operation_type == "sketch.add_geometry":
+            _validate_sketch_geometry_arguments(arguments)
+        if operation_type == "sketch.add_constraint":
+            _validate_sketch_constraint_arguments(arguments)
+        if operation_type.startswith("partdesign."):
+            _validate_partdesign_arguments(operation_type, arguments)
+        for key, value in arguments.items():
+            if key == "translation_mm":
+                _validate_translation(value)
+                continue
+            if key == "plane_offset_mm":
+                if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or abs(float(value)) > MAX_SKETCH_COORDINATE_MM:
+                    raise ValueError("plane_offset_mm must be a bounded finite number")
+                continue
+            if key.endswith("_mm") and (not isinstance(value, (int, float)) or value <= 0):
+                raise ValueError(f"Dimension must be positive: {key}")
+        parameters = arguments.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            raise ValueError("Operation parameters must be an object")
+        for key, value in parameters.items():
+            if key not in PARAMETER_PROPERTIES:
+                raise ValueError(f"Unsupported parameter: {key}")
+            if not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"Parameter must be positive: {key}")
+    return operations
+
+
+def requires_user_approval(plan: dict[str, Any]) -> bool:
+    """Return whether a valid plan mutates the FreeCAD document."""
+    return any(operation["type"] in MUTATING_OPERATIONS for operation in validate_plan(plan))
+
+
+def _shape_payload(obj: Any) -> dict[str, Any] | None:
+    shape = getattr(obj, "Shape", None)
+    if shape is None or shape.isNull():
+        return None
+    bbox = shape.BoundBox
+    dimensions = (bbox.XLength, bbox.YLength, bbox.ZLength)
+    if any(not math.isfinite(float(value)) or abs(float(value)) > 1_000_000_000 for value in dimensions):
+        return None
+    return {
+        "valid": bool(shape.isValid()),
+        "bbox_mm": [round(float(value), 3) for value in dimensions],
+        "volume_mm3": round(float(shape.Volume), 3),
+    }
+
+
+def _object_payload(obj: Any) -> dict[str, Any]:
+    stable_id = getattr(obj, "AgenticStableId", "")
+    return {
+        "name": obj.Name,
+        "label": obj.Label,
+        "type_id": obj.TypeId,
+        "stable_id": stable_id or obj.Name,
+        "shape": _shape_payload(obj),
+    }
+
+
+def get_document_context() -> dict[str, Any]:
+    """Read the active document and GUI selection for planner grounding."""
+    import FreeCAD  # type: ignore
+    try:
+        import FreeCADGui as Gui  # type: ignore
+    except ImportError:
+        Gui = None
+    if Gui is not None and not hasattr(Gui, "Selection"):
+        Gui = None
+
+    document = FreeCAD.ActiveDocument
+    if document is None:
+        return {"document": None, "objects": [], "selection": []}
+
+    selected_names: set[str] = set()
+    if Gui:
+        for selected in Gui.Selection.getSelection():
+            candidate = selected
+            if not getattr(candidate, "AgenticStableId", ""):
+                tip = getattr(candidate, "Tip", None)
+                if tip is not None and getattr(tip, "AgenticStableId", ""):
+                    candidate = tip
+            selected_names.add(candidate.Name)
+
+    objects = [_object_payload(obj) for obj in document.Objects]
+    return {
+        "document": {
+            "name": document.Name,
+            "label": document.Label,
+            "file_name": getattr(document, "FileName", ""),
+        },
+        "objects": objects,
+        "selection": [item for item in objects if item["name"] in selected_names],
+    }
+
+
+def _attach_agent_metadata(obj: Any, stable_id: str, plan_id: str) -> None:
+    if "AgenticStableId" not in obj.PropertiesList:
+        obj.addProperty("App::PropertyString", "AgenticStableId", "Agentic", "Stable agent object ID")
+    if "AgenticPlanId" not in obj.PropertiesList:
+        obj.addProperty("App::PropertyString", "AgenticPlanId", "Agentic", "Plan that created this object")
+    obj.AgenticStableId = stable_id
+    obj.AgenticPlanId = plan_id
+
+
+def _ensure_part_objects_registered() -> None:
+    """Load the Part module so FreeCADCmd registers Part::Box/Cylinder types."""
+    import Part  # type: ignore  # noqa: F401
+
+
+def _create_box(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    _ensure_part_objects_registered()
+    suffix = uuid.uuid4().hex[:8]
+    feature = document.addObject("Part::Box", f"AgenticBox_{suffix}")
+    feature.Label = arguments.get("label") or "Agentic Box"
+    feature.Length = float(arguments["length_mm"])
+    feature.Width = float(arguments["width_mm"])
+    feature.Height = float(arguments["height_mm"])
+    _attach_agent_metadata(feature, f"agentic-box-{suffix}", plan_id)
+    return feature
+
+
+def _create_cylinder(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    _ensure_part_objects_registered()
+    suffix = uuid.uuid4().hex[:8]
+    feature = document.addObject("Part::Cylinder", f"AgenticCylinder_{suffix}")
+    feature.Label = arguments.get("label") or "Agentic Cylinder"
+    feature.Radius = float(arguments["radius_mm"])
+    feature.Height = float(arguments["height_mm"])
+    _attach_agent_metadata(feature, f"agentic-cylinder-{suffix}", plan_id)
+    return feature
+
+
+def _find_target(document: Any, stable_id: str) -> Any:
+    for obj in document.Objects:
+        if obj.Name == stable_id or getattr(obj, "AgenticStableId", "") == stable_id:
+            return obj
+    raise ValueError(f"Target object no longer exists: {stable_id}")
+
+
+def _update_parameters(document: Any, operation: dict[str, Any]) -> tuple[Any, dict[str, float]]:
+    target = _find_target(document, str(operation.get("target") or ""))
+    changed = {}
+    for parameter, value in operation["arguments"]["parameters"].items():
+        property_name = PARAMETER_PROPERTIES[parameter]
+        if property_name not in target.PropertiesList:
+            raise ValueError(f"{target.Label} does not support {parameter}")
+        setattr(target, property_name, float(value))
+        changed[parameter] = float(value)
+    return target, changed
+
+
+def _translate_object(document: Any, operation: dict[str, Any]) -> tuple[Any, list[float]]:
+    target = _find_target(document, str(operation.get("target") or ""))
+    translation = [float(value) for value in operation["arguments"]["translation_mm"]]
+    import FreeCAD  # type: ignore
+
+    placement = target.Placement
+    placement.Base = placement.Base + FreeCAD.Vector(*translation)
+    target.Placement = placement
+    return target, translation
+
+
+def _plane_rotation(plane: str) -> Any:
+    import FreeCAD  # type: ignore
+
+    if plane == "XZ":
+        return FreeCAD.Rotation(FreeCAD.Vector(1.0, 0.0, 0.0), 90.0)
+    if plane == "YZ":
+        return FreeCAD.Rotation(FreeCAD.Vector(1.0, 1.0, 1.0), 120.0)
+    return FreeCAD.Rotation(FreeCAD.Vector(0.0, 0.0, 1.0), 0.0)
+
+
+def _ensure_sketcher_registered() -> None:
+    """Load the Sketcher module so FreeCADCmd registers Sketcher::SketchObject."""
+    import Sketcher  # type: ignore  # noqa: F401
+
+
+def _create_sketch(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    _ensure_sketcher_registered()
+    suffix = uuid.uuid4().hex[:8]
+    sketch = document.addObject("Sketcher::SketchObject", f"AgenticSketch_{suffix}")
+    sketch.Label = arguments.get("label") or "Agentic Sketch"
+    placement = sketch.Placement
+    placement.Rotation = _plane_rotation(str(arguments.get("plane")))
+    sketch.Placement = placement
+    body_target = arguments.get("body_target")
+    if body_target:
+        body = _find_target(document, str(body_target))
+        add_object = getattr(body, "addObject", None)
+        if not callable(add_object):
+            raise ValueError(f"body_target cannot contain a sketch: {body.Label}")
+        add_object(sketch)
+    _attach_agent_metadata(sketch, f"agentic-sketch-{suffix}", plan_id)
+    return sketch
+
+
+def _sketch_target(document: Any, operation: dict[str, Any]) -> Any:
+    target = _find_target(document, str(operation.get("target") or ""))
+    if not str(getattr(target, "TypeId", "")).startswith("Sketcher::"):
+        raise ValueError(f"Target is not a sketch: {target.Label}")
+    return target
+
+
+def _sketch_vector(point: list[Any]) -> Any:
+    import FreeCAD  # type: ignore
+
+    return FreeCAD.Vector(float(point[0]), float(point[1]), 0.0)
+
+
+def _sketch_normal() -> Any:
+    import FreeCAD  # type: ignore
+
+    return FreeCAD.Vector(0.0, 0.0, 1.0)
+
+
+def _add_one_geometry(sketch: Any, spec: dict[str, Any]) -> list[int]:
+    import Part  # type: ignore
+
+    kind = spec["kind"]
+    if kind == "line":
+        segment = Part.LineSegment(_sketch_vector(spec["start"]), _sketch_vector(spec["end"]))
+        return [int(sketch.addGeometry(segment, False))]
+    if kind == "circle":
+        circle = Part.Circle(_sketch_vector(spec["center"]), _sketch_normal(), float(spec["radius_mm"]))
+        return [int(sketch.addGeometry(circle, False))]
+    if kind == "arc":
+        base_circle = Part.Circle(
+            _sketch_vector(spec["center"]),
+            _sketch_normal(),
+            float(spec["radius_mm"]),
+        )
+        arc = Part.ArcOfCircle(
+            base_circle,
+            math.radians(float(spec["start_angle_deg"])),
+            math.radians(float(spec["end_angle_deg"])),
+        )
+        return [int(sketch.addGeometry(arc, False))]
+    if kind == "rectangle":
+        return _add_rectangle(sketch, spec)
+    raise ValueError(f"Unsupported sketch geometry kind: {kind}")
+
+
+def _add_rectangle(sketch: Any, spec: dict[str, Any]) -> list[int]:
+    import Part  # type: ignore
+    import Sketcher  # type: ignore
+
+    x0, y0 = (float(value) for value in spec["corner"])
+    x1 = x0 + float(spec["width_mm"])
+    y1 = y0 + float(spec["height_mm"])
+    corners = ([x0, y0], [x1, y0], [x1, y1], [x0, y1])
+    indices: list[int] = []
+    for start, end in zip(corners, corners[1:] + corners[:1]):
+        segment = Part.LineSegment(_sketch_vector(start), _sketch_vector(end))
+        indices.append(int(sketch.addGeometry(segment, False)))
+    end_point = SKETCH_POINT_CODES["end"]
+    start_point = SKETCH_POINT_CODES["start"]
+    for first, second in zip(indices, indices[1:] + indices[:1]):
+        sketch.addConstraint(Sketcher.Constraint("Coincident", first, end_point, second, start_point))
+    sketch.addConstraint(Sketcher.Constraint("Horizontal", indices[0]))
+    sketch.addConstraint(Sketcher.Constraint("Horizontal", indices[2]))
+    sketch.addConstraint(Sketcher.Constraint("Vertical", indices[1]))
+    sketch.addConstraint(Sketcher.Constraint("Vertical", indices[3]))
+    return indices
+
+
+def _add_sketch_geometry(document: Any, operation: dict[str, Any]) -> tuple[Any, list[int]]:
+    sketch = _sketch_target(document, operation)
+    indices: list[int] = []
+    for spec in operation["arguments"]["geometry"]:
+        indices.extend(_add_one_geometry(sketch, spec))
+    return sketch, indices
+
+
+def _add_one_constraint(sketch: Any, spec: dict[str, Any]) -> None:
+    import Sketcher  # type: ignore
+
+    kind = spec["kind"]
+    codes = SKETCH_POINT_CODES
+    if kind == "coincident":
+        first, second = spec["first"], spec["second"]
+        sketch.addConstraint(
+            Sketcher.Constraint("Coincident", first["index"], codes[first["point"]], second["index"], codes[second["point"]])
+        )
+    elif kind in {"horizontal", "vertical"}:
+        sketch.addConstraint(Sketcher.Constraint(kind.capitalize(), spec["index"]))
+    elif kind == "distance":
+        if "index" in spec:
+            sketch.addConstraint(Sketcher.Constraint("Distance", spec["index"], float(spec["value_mm"])))
+        else:
+            first, second = spec["first"], spec["second"]
+            sketch.addConstraint(
+                Sketcher.Constraint(
+                    "Distance",
+                    first["index"],
+                    codes[first["point"]],
+                    second["index"],
+                    codes[second["point"]],
+                    float(spec["value_mm"]),
+                )
+            )
+    elif kind in {"distance_x", "distance_y"}:
+        constraint_name = "DistanceX" if kind == "distance_x" else "DistanceY"
+        first, second = spec["first"], spec["second"]
+        sketch.addConstraint(
+            Sketcher.Constraint(
+                constraint_name,
+                first["index"],
+                codes[first["point"]],
+                second["index"],
+                codes[second["point"]],
+                float(spec["value_mm"]),
+            )
+        )
+    elif kind in {"radius", "diameter"}:
+        sketch.addConstraint(Sketcher.Constraint(kind.capitalize(), spec["index"], float(spec["value_mm"])))
+    elif kind == "angle":
+        sketch.addConstraint(
+            Sketcher.Constraint("Angle", spec["first_index"], spec["second_index"], math.radians(float(spec["value_deg"])))
+        )
+    elif kind == "symmetric":
+        first, second = spec["first"], spec["second"]
+        sketch.addConstraint(
+            Sketcher.Constraint(
+                "Symmetric",
+                first["index"],
+                codes[first["point"]],
+                second["index"],
+                codes[second["point"]],
+                spec["reference_index"],
+            )
+        )
+    else:
+        raise ValueError(f"Unsupported sketch constraint kind: {kind}")
+
+
+def _add_sketch_constraints(document: Any, operation: dict[str, Any]) -> tuple[Any, int]:
+    sketch = _sketch_target(document, operation)
+    count = 0
+    for spec in operation["arguments"]["constraints"]:
+        _add_one_constraint(sketch, spec)
+        count += 1
+    return sketch, count
+
+
+def _create_partdesign_body(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    suffix = uuid.uuid4().hex[:8]
+    body = document.addObject("PartDesign::Body", f"AgenticBody_{suffix}")
+    body.Label = arguments.get("label") or "Agentic Body"
+    _attach_agent_metadata(body, f"agentic-body-{suffix}", plan_id)
+    return body
+
+
+def _find_body_of_sketch(document: Any, sketch: Any) -> Any:
+    for obj in document.Objects:
+        if str(getattr(obj, "TypeId", "")) == "PartDesign::Body" and sketch in (getattr(obj, "Group", None) or []):
+            return obj
+    raise ValueError(f"Sketch is not inside a PartDesign body: {sketch.Label}")
+
+
+def _new_body_feature(document: Any, body: Any, type_id: str, name: str) -> Any:
+    new_object = getattr(body, "newObject", None)
+    if callable(new_object):
+        return new_object(type_id, name)
+    feature = document.addObject(type_id, name)
+    body.addObject(feature)
+    return feature
+
+
+def _create_pad(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    sketch = _sketch_target(document, operation)
+    body = _find_body_of_sketch(document, sketch)
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    feature = _new_body_feature(document, body, "PartDesign::Pad", f"AgenticPad_{suffix}")
+    feature.Profile = sketch
+    feature.Length = float(arguments["length_mm"])
+    if arguments.get("symmetric"):
+        feature.Midplane = True
+    if arguments.get("reversed"):
+        feature.Reversed = True
+    feature.Label = arguments.get("label") or "Agentic Pad"
+    _attach_agent_metadata(feature, f"agentic-pad-{suffix}", plan_id)
+    return feature
+
+
+def _create_pocket(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    sketch = _sketch_target(document, operation)
+    body = _find_body_of_sketch(document, sketch)
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    feature = _new_body_feature(document, body, "PartDesign::Pocket", f"AgenticPocket_{suffix}")
+    feature.Profile = sketch
+    if arguments.get("through_all"):
+        feature.Type = "ThroughAll"
+    else:
+        feature.Length = float(arguments["length_mm"])
+    if arguments.get("reversed"):
+        feature.Reversed = True
+    feature.Label = arguments.get("label") or "Agentic Pocket"
+    _attach_agent_metadata(feature, f"agentic-pocket-{suffix}", plan_id)
+    return feature
+
+
+def _create_revolution(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    sketch = _sketch_target(document, operation)
+    body = _find_body_of_sketch(document, sketch)
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    feature = _new_body_feature(document, body, "PartDesign::Revolution", f"AgenticRevolution_{suffix}")
+    feature.Profile = sketch
+    feature.ReferenceAxis = (sketch, [REVOLUTION_AXES[arguments.get("axis", "v_axis")]])
+    feature.Angle = float(arguments["angle_deg"])
+    feature.Label = arguments.get("label") or "Agentic Revolution"
+    _attach_agent_metadata(feature, f"agentic-revolution-{suffix}", plan_id)
+    return feature
+
+
+def _create_hole(document: Any, operation: dict[str, Any], plan_id: str) -> tuple[Any, Any]:
+    import FreeCAD  # type: ignore
+
+    body = _find_target(document, str(operation.get("target") or ""))
+    if str(getattr(body, "TypeId", "")) != "PartDesign::Body":
+        raise ValueError(f"Hole target must be a PartDesign body: {body.Label}")
+    arguments = operation["arguments"]
+    plane = str(arguments["plane"])
+    sketch = _create_sketch(
+        document,
+        {"plane": plane, "label": "Agentic Hole Sketch", "body_target": str(operation["target"])},
+        plan_id,
+    )
+    offset = float(arguments.get("plane_offset_mm") or 0.0)
+    if offset:
+        normal = SKETCH_PLANE_NORMALS[plane]
+        placement = sketch.Placement
+        placement.Base = placement.Base + FreeCAD.Vector(*(component * offset for component in normal))
+        sketch.Placement = placement
+    radius = float(arguments["diameter_mm"]) / 2.0
+    for position in arguments["positions"]:
+        _add_one_geometry(sketch, {"kind": "circle", "center": position, "radius_mm": radius})
+    pocket_operation = {
+        "type": "partdesign.pocket",
+        "target": sketch.AgenticStableId,
+        "arguments": {
+            "through_all": bool(arguments.get("through_all")),
+            "length_mm": arguments.get("depth_mm"),
+            "reversed": arguments.get("reversed"),
+            "label": arguments.get("label") or "Agentic Hole",
+        },
+    }
+    feature = _create_pocket(document, pocket_operation, plan_id)
+    return feature, sketch
+
+
+def _body_target(document: Any, operation: dict[str, Any]) -> Any:
+    body = _find_target(document, str(operation.get("target") or ""))
+    if str(getattr(body, "TypeId", "")) != "PartDesign::Body":
+        raise ValueError(f"Target must be a PartDesign body: {body.Label}")
+    return body
+
+
+def _body_tip(body: Any) -> Any:
+    tip = getattr(body, "Tip", None)
+    if tip is None:
+        raise ValueError(f"Body has no features to modify: {body.Label}")
+    return tip
+
+
+def _origin_feature(body: Any, role: str) -> Any:
+    origin = getattr(body, "Origin", None)
+    for feature in getattr(origin, "OriginFeatures", None) or []:
+        if str(getattr(feature, "Role", "")) == role:
+            return feature
+    raise ValueError(f"Body origin feature not found: {role}")
+
+
+def _tip_edge_names(tip: Any) -> list[str]:
+    edges = getattr(getattr(tip, "Shape", None), "Edges", None) or []
+    if not edges:
+        raise ValueError(f"Tip feature has no edges to dress up: {tip.Label}")
+    return [f"Edge{index}" for index in range(1, len(edges) + 1)]
+
+
+def _create_dressup(document: Any, operation: dict[str, Any], plan_id: str, *, kind: str) -> Any:
+    body = _body_target(document, operation)
+    tip = _body_tip(body)
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    type_id = "PartDesign::Fillet" if kind == "fillet" else "PartDesign::Chamfer"
+    feature = _new_body_feature(document, body, type_id, f"Agentic{kind.capitalize()}_{suffix}")
+    feature.Base = (tip, _tip_edge_names(tip))
+    if kind == "fillet":
+        feature.Radius = float(arguments["radius_mm"])
+    else:
+        feature.Size = float(arguments["size_mm"])
+    feature.Label = arguments.get("label") or f"Agentic {kind.capitalize()}"
+    _attach_agent_metadata(feature, f"agentic-{kind}-{suffix}", plan_id)
+    return feature
+
+
+def _create_mirror(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    body = _body_target(document, operation)
+    tip = _body_tip(body)
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    feature = _new_body_feature(document, body, "PartDesign::Mirrored", f"AgenticMirror_{suffix}")
+    feature.Originals = [tip]
+    feature.MirrorPlane = (_origin_feature(body, f"{arguments['plane']}_Plane"), [""])
+    feature.Label = arguments.get("label") or "Agentic Mirror"
+    # FreeCAD does not advance the body tip for transformed features the way it
+    # does for sketch-based/dressup features; without this the body keeps the
+    # pre-mirror shape after save/reload.
+    body.Tip = feature
+    _attach_agent_metadata(feature, f"agentic-mirror-{suffix}", plan_id)
+    return feature
+
+
+def _create_linear_pattern(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    body = _body_target(document, operation)
+    tip = _body_tip(body)
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    feature = _new_body_feature(document, body, "PartDesign::LinearPattern", f"AgenticPattern_{suffix}")
+    feature.Originals = [tip]
+    feature.Direction = (_origin_feature(body, PATTERN_AXES[arguments["axis"]]), [""])
+    feature.Length = float(arguments["length_mm"])
+    feature.Occurrences = int(arguments["occurrences"])
+    feature.Label = arguments.get("label") or "Agentic Linear Pattern"
+    # See _create_mirror: transformed features do not advance the body tip.
+    body.Tip = feature
+    _attach_agent_metadata(feature, f"agentic-pattern-{suffix}", plan_id)
+    return feature
+
+
+def _sketch_payload(obj: Any) -> dict[str, Any]:
+    geometry = getattr(obj, "Geometry", None) or []
+    constraints = getattr(obj, "Constraints", None) or []
+    solver_status: int | None = None
+    solve = getattr(obj, "solve", None)
+    if callable(solve):
+        solver_status = int(solve())
+    return {
+        "geometry_count": len(geometry),
+        "constraint_count": len(constraints),
+        "solver_status": solver_status,
+    }
+
+
+def _is_sketch(obj: Any) -> bool:
+    return str(getattr(obj, "TypeId", "")).startswith("Sketcher::")
+
+
+def _is_body(obj: Any) -> bool:
+    return str(getattr(obj, "TypeId", "")) == "PartDesign::Body"
+
+
+def _verify_objects(objects: list[Any]) -> list[dict[str, Any]]:
+    evidence = []
+    for obj in objects:
+        if _is_body(obj):
+            evidence.append({"object": _object_payload(obj), "checks": {"body_created": True}})
+            continue
+        if _is_sketch(obj):
+            payload = _sketch_payload(obj)
+            if payload["solver_status"] not in (None, 0):
+                raise RuntimeError(f"Sketch constraints failed to solve: {obj.Label}")
+            evidence.append(
+                {
+                    "object": _object_payload(obj),
+                    "checks": {"sketch_solved": payload["solver_status"] in (None, 0)},
+                    "sketch": payload,
+                }
+            )
+            continue
+        shape = _shape_payload(obj)
+        if shape is None or not shape["valid"] or shape["volume_mm3"] <= 0:
+            raise RuntimeError(f"FreeCAD produced an invalid shape: {obj.Label}")
+        evidence.append({"object": _object_payload(obj), "checks": {"shape_valid": True, "positive_volume": True}})
+    return evidence
+
+
+def execute_plan(plan: dict[str, Any], *, approved: bool = False) -> dict[str, Any]:
+    """Execute one plan atomically and return measured FreeCAD evidence."""
+    import FreeCAD  # type: ignore
+    operations = validate_plan(plan)
+    if any(operation["type"] in MUTATING_OPERATIONS for operation in operations) and not approved:
+        raise PermissionError("Mutating FreeCAD plans require explicit user approval")
+    document = FreeCAD.ActiveDocument or FreeCAD.newDocument("AgenticCAD")
+    if document.UndoMode == 0:
+        document.UndoMode = 1
+
+    if len(operations) == 1 and operations[0]["type"] == "document.inspect":
+        context = get_document_context()
+        return {"status": "succeeded", "summary": f"{len(context['objects'])} objects", "context": context, "evidence": []}
+    if len(operations) == 1 and operations[0]["type"] == "document.undo":
+        document.undo()
+        document.recompute()
+        _safe_update_gui()
+        return {"status": "succeeded", "summary": "Previous transaction undone", "context": get_document_context(), "evidence": []}
+
+    changed_objects = []
+    changes = []
+    plan_aliases: dict[str, str] = {}
+    document.openTransaction(f"Agentic {plan['plan_id']}")
+    try:
+        for operation in operations:
+            operation = _resolve_operation_aliases(operation, plan_aliases)
+            operation_type = operation["type"]
+            if operation_type == "primitive.create_box":
+                obj = _create_box(document, operation["arguments"], plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": "box"})
+            elif operation_type == "primitive.create_cylinder":
+                obj = _create_cylinder(document, operation["arguments"], plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": "cylinder"})
+            elif operation_type == "object.update_parameters":
+                obj, changed = _update_parameters(document, operation)
+                changed_objects.append(obj)
+                changes.append({"stable_id": operation["target"], "parameters": changed})
+            elif operation_type == "object.translate":
+                obj, translation = _translate_object(document, operation)
+                changed_objects.append(obj)
+                changes.append({"stable_id": operation["target"], "translation_mm": translation})
+            elif operation_type == "sketch.create":
+                obj = _create_sketch(document, operation["arguments"], plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "sketch",
+                        "plane": operation["arguments"]["plane"],
+                    }
+                )
+            elif operation_type == "sketch.add_geometry":
+                obj, indices = _add_sketch_geometry(document, operation)
+                changed_objects.append(obj)
+                changes.append({"stable_id": operation["target"], "geometry_indices": indices})
+            elif operation_type == "sketch.add_constraint":
+                obj, constraint_count = _add_sketch_constraints(document, operation)
+                changed_objects.append(obj)
+                changes.append({"stable_id": operation["target"], "constraints_added": constraint_count})
+            elif operation_type == "partdesign.create_body":
+                obj = _create_partdesign_body(document, operation["arguments"], plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": "body"})
+            elif operation_type == "partdesign.pad":
+                obj = _create_pad(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "pad",
+                        "profile": operation["target"],
+                        "length_mm": float(operation["arguments"]["length_mm"]),
+                    }
+                )
+            elif operation_type == "partdesign.pocket":
+                obj = _create_pocket(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": "pocket", "profile": operation["target"]})
+            elif operation_type == "partdesign.revolution":
+                obj = _create_revolution(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "revolution",
+                        "profile": operation["target"],
+                        "angle_deg": float(operation["arguments"]["angle_deg"]),
+                    }
+                )
+            elif operation_type in {"partdesign.fillet", "partdesign.chamfer"}:
+                kind = operation_type.rsplit(".", 1)[1]
+                obj = _create_dressup(document, operation, plan["plan_id"], kind=kind)
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": kind, "body": operation["target"]})
+            elif operation_type == "partdesign.mirror":
+                obj = _create_mirror(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "mirror",
+                        "body": operation["target"],
+                        "plane": operation["arguments"]["plane"],
+                    }
+                )
+            elif operation_type == "partdesign.linear_pattern":
+                obj = _create_linear_pattern(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "linear_pattern",
+                        "body": operation["target"],
+                        "occurrences": int(operation["arguments"]["occurrences"]),
+                    }
+                )
+            elif operation_type == "partdesign.hole":
+                obj, hole_sketch = _create_hole(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changed_objects.append(hole_sketch)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "hole",
+                        "body": operation["target"],
+                        "hole_count": len(operation["arguments"]["positions"]),
+                        "diameter_mm": float(operation["arguments"]["diameter_mm"]),
+                    }
+                )
+            else:
+                raise ValueError(f"Operation cannot be mixed into a mutation plan: {operation_type}")
+            alias = operation.get("alias")
+            if alias:
+                plan_aliases[str(alias)] = str(obj.AgenticStableId)
+        document.recompute()
+        evidence = _verify_objects(changed_objects)
+        document.commitTransaction()
+    except Exception:
+        document.abortTransaction()
+        document.recompute()
+        raise
+
+    _safe_update_gui()
+    return {
+        "status": "succeeded",
+        "summary": f"Executed {len(operations)} typed operation(s)",
+        "changed": changes,
+        "evidence": evidence,
+        "context": get_document_context(),
+    }
+
+
+def _safe_update_gui() -> None:
+    """Refresh FreeCAD GUI without touching camera/view C++ methods.
+
+    FreeCADCmd does not need this. In the macOS GUI, direct activeView camera
+    calls can be brittle when the Start page and a 3D document coexist, so the
+    plugin keeps mutation correctness separate from optional visual framing.
+    """
+    try:
+        import FreeCADGui as Gui  # type: ignore
+
+        update = getattr(Gui, "updateGui", None)
+        if callable(update):
+            update()
+    except Exception:
+        return
+
+
+def _validate_translation(value: Any) -> None:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError("translation_mm must be a 3-element list")
+    for component in value:
+        if not isinstance(component, (int, float)):
+            raise ValueError("translation_mm components must be numeric")
+        if not math.isfinite(float(component)) or abs(float(component)) > MAX_TRANSLATION_MM:
+            raise ValueError("translation_mm component is out of range")
+    if not any(float(component) != 0.0 for component in value):
+        raise ValueError("translation_mm must not be a zero vector")
+
+
+def _validate_operation_alias(
+    operation: dict[str, Any],
+    operation_type: str,
+    arguments: dict[str, Any],
+    declared_aliases: set[str],
+) -> None:
+    """Statically validate in-plan alias declarations and references.
+
+    Aliases let a later operation target an object created earlier in the same
+    plan (`"target": "@alias:plate_sketch"`). References must point to an
+    alias declared by an earlier creation operation, so broken plans fail
+    before any FreeCAD transaction opens.
+    """
+    for reference in (operation.get("target"), arguments.get("body_target")):
+        if isinstance(reference, str) and reference.startswith(ALIAS_REF_PREFIX):
+            name = reference[len(ALIAS_REF_PREFIX) :]
+            if name not in declared_aliases:
+                raise ValueError(f"Alias is referenced before it is created: {name}")
+    alias = operation.get("alias")
+    if alias is None:
+        return
+    if not isinstance(alias, str) or not alias.strip():
+        raise ValueError("Operation alias must be a non-empty string")
+    if operation_type not in CREATION_OPERATIONS:
+        raise ValueError(f"Only creation operations may declare an alias: {operation_type}")
+    if alias in declared_aliases:
+        raise ValueError(f"Duplicate operation alias: {alias}")
+    declared_aliases.add(alias)
+
+
+def _resolve_operation_aliases(operation: dict[str, Any], plan_aliases: dict[str, str]) -> dict[str, Any]:
+    resolved = dict(operation)
+    resolved["arguments"] = dict(operation.get("arguments") or {})
+
+    def _resolve(value: Any) -> Any:
+        if isinstance(value, str) and value.startswith(ALIAS_REF_PREFIX):
+            name = value[len(ALIAS_REF_PREFIX) :]
+            if name not in plan_aliases:
+                raise ValueError(f"Alias did not resolve to a created object: {name}")
+            return plan_aliases[name]
+        return value
+
+    if "target" in resolved:
+        resolved["target"] = _resolve(resolved["target"])
+    if "body_target" in resolved["arguments"]:
+        resolved["arguments"]["body_target"] = _resolve(resolved["arguments"]["body_target"])
+    return resolved
+
+
+def _validate_sketch_point(value: Any, field: str) -> None:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{field} must be a 2-element [x, y] list")
+    for component in value:
+        if not isinstance(component, (int, float)) or isinstance(component, bool):
+            raise ValueError(f"{field} components must be numeric")
+        if not math.isfinite(float(component)) or abs(float(component)) > MAX_SKETCH_COORDINATE_MM:
+            raise ValueError(f"{field} component is out of range")
+
+
+def _validate_positive_mm(spec: dict[str, Any], key: str) -> None:
+    value = spec.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"{key} must be a positive finite number")
+
+
+def _validate_geometry_index(value: Any, field: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative geometry index")
+
+
+def _validate_point_ref(value: Any, field: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object with index and point")
+    _validate_geometry_index(value.get("index"), f"{field}.index")
+    if value.get("point") not in SKETCH_POINT_CODES:
+        raise ValueError(f"{field}.point must be one of {sorted(SKETCH_POINT_CODES)}")
+
+
+def _validate_sketch_geometry_arguments(arguments: dict[str, Any]) -> None:
+    geometry = arguments.get("geometry")
+    if not isinstance(geometry, list) or not geometry:
+        raise ValueError("sketch.add_geometry requires a non-empty geometry list")
+    for spec in geometry:
+        if not isinstance(spec, dict):
+            raise ValueError("Geometry entries must be objects")
+        kind = spec.get("kind")
+        if kind not in SKETCH_GEOMETRY_KINDS:
+            raise ValueError(f"Unsupported sketch geometry kind: {kind}")
+        if kind == "line":
+            _validate_sketch_point(spec.get("start"), "line.start")
+            _validate_sketch_point(spec.get("end"), "line.end")
+            if [float(v) for v in spec["start"]] == [float(v) for v in spec["end"]]:
+                raise ValueError("line start and end must differ")
+        elif kind == "circle":
+            _validate_sketch_point(spec.get("center"), "circle.center")
+            _validate_positive_mm(spec, "radius_mm")
+        elif kind == "arc":
+            _validate_sketch_point(spec.get("center"), "arc.center")
+            _validate_positive_mm(spec, "radius_mm")
+            for key in ("start_angle_deg", "end_angle_deg"):
+                value = spec.get(key)
+                if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+                    raise ValueError(f"{key} must be a finite number")
+            if float(spec["start_angle_deg"]) == float(spec["end_angle_deg"]):
+                raise ValueError("arc start and end angles must differ")
+        elif kind == "rectangle":
+            _validate_sketch_point(spec.get("corner"), "rectangle.corner")
+            _validate_positive_mm(spec, "width_mm")
+            _validate_positive_mm(spec, "height_mm")
+
+
+def _validate_sketch_constraint_arguments(arguments: dict[str, Any]) -> None:
+    constraints = arguments.get("constraints")
+    if not isinstance(constraints, list) or not constraints:
+        raise ValueError("sketch.add_constraint requires a non-empty constraints list")
+    for spec in constraints:
+        if not isinstance(spec, dict):
+            raise ValueError("Constraint entries must be objects")
+        kind = spec.get("kind")
+        if kind not in SKETCH_CONSTRAINT_KINDS:
+            raise ValueError(f"Unsupported sketch constraint kind: {kind}")
+        if kind == "coincident":
+            _validate_point_ref(spec.get("first"), "coincident.first")
+            _validate_point_ref(spec.get("second"), "coincident.second")
+        elif kind in {"horizontal", "vertical"}:
+            _validate_geometry_index(spec.get("index"), f"{kind}.index")
+        elif kind == "distance":
+            if "index" in spec:
+                _validate_geometry_index(spec.get("index"), "distance.index")
+            else:
+                _validate_point_ref(spec.get("first"), "distance.first")
+                _validate_point_ref(spec.get("second"), "distance.second")
+            _validate_positive_mm(spec, "value_mm")
+        elif kind in {"distance_x", "distance_y"}:
+            _validate_point_ref(spec.get("first"), f"{kind}.first")
+            _validate_point_ref(spec.get("second"), f"{kind}.second")
+            value = spec.get("value_mm")
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value == 0:
+                raise ValueError("value_mm must be a non-zero finite number")
+        elif kind in {"radius", "diameter"}:
+            _validate_geometry_index(spec.get("index"), f"{kind}.index")
+            _validate_positive_mm(spec, "value_mm")
+        elif kind == "angle":
+            _validate_geometry_index(spec.get("first_index"), "angle.first_index")
+            _validate_geometry_index(spec.get("second_index"), "angle.second_index")
+            value = spec.get("value_deg")
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+                raise ValueError("value_deg must be a finite number")
+            if not 0.0 < abs(float(value)) < 360.0:
+                raise ValueError("value_deg must be between 0 and 360 degrees exclusive")
+        elif kind == "symmetric":
+            _validate_point_ref(spec.get("first"), "symmetric.first")
+            _validate_point_ref(spec.get("second"), "symmetric.second")
+            _validate_geometry_index(spec.get("reference_index"), "symmetric.reference_index")
+
+
+def _validate_partdesign_arguments(operation_type: str, arguments: dict[str, Any]) -> None:
+    if operation_type == "partdesign.pad":
+        _validate_positive_mm(arguments, "length_mm")
+    elif operation_type == "partdesign.pocket":
+        if not arguments.get("through_all"):
+            _validate_positive_mm(arguments, "length_mm")
+    elif operation_type == "partdesign.revolution":
+        angle = arguments.get("angle_deg")
+        if not isinstance(angle, (int, float)) or isinstance(angle, bool) or not math.isfinite(float(angle)):
+            raise ValueError("angle_deg must be a finite number")
+        if not 0.0 < float(angle) <= 360.0:
+            raise ValueError("angle_deg must be within (0, 360]")
+        axis = arguments.get("axis", "v_axis")
+        if axis not in REVOLUTION_AXES:
+            raise ValueError(f"axis must be one of {sorted(REVOLUTION_AXES)}")
+    elif operation_type == "partdesign.hole":
+        if arguments.get("plane") not in SKETCH_PLANES:
+            raise ValueError(f"Hole plane must be one of {SKETCH_PLANES}")
+        positions = arguments.get("positions")
+        if not isinstance(positions, list) or not positions:
+            raise ValueError("partdesign.hole requires a non-empty positions list")
+        for position in positions:
+            _validate_sketch_point(position, "hole.position")
+        _validate_positive_mm(arguments, "diameter_mm")
+        if not arguments.get("through_all"):
+            _validate_positive_mm(arguments, "depth_mm")
+    elif operation_type == "partdesign.fillet":
+        _validate_positive_mm(arguments, "radius_mm")
+    elif operation_type == "partdesign.chamfer":
+        _validate_positive_mm(arguments, "size_mm")
+    elif operation_type == "partdesign.mirror":
+        if arguments.get("plane") not in SKETCH_PLANES:
+            raise ValueError(f"Mirror plane must be one of {SKETCH_PLANES}")
+    elif operation_type == "partdesign.linear_pattern":
+        if arguments.get("axis") not in PATTERN_AXES:
+            raise ValueError(f"Pattern axis must be one of {sorted(PATTERN_AXES)}")
+        _validate_positive_mm(arguments, "length_mm")
+        occurrences = arguments.get("occurrences")
+        if not isinstance(occurrences, int) or isinstance(occurrences, bool) or not 2 <= occurrences <= MAX_PATTERN_OCCURRENCES:
+            raise ValueError(f"occurrences must be an integer in [2, {MAX_PATTERN_OCCURRENCES}]")

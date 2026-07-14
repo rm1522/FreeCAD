@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<package format="1">
+  <name>AgenticCAD</name>
+  <version>0.1.0</version>
+  <date>2026-07-11</date>
+  <description>Agentic CAD Workbench plugin for connecting FreeCAD to the local agentic-cad backend.</description>
+  <maintainer email="dev@agentic-cad.local">agentic-cad</maintainer>
+  <license>LGPL-2.1-or-later</license>
+  <url type="repository">https://github.com/SALT2-Boost/ai-agentic-cad</url>
+  <content>
+    <workbench>Agentic CAD</workbench>
+  </content>
+</package>

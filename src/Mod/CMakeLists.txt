@@ -1,3 +1,9 @@
+
+option(BUILD_AGENTIC "Build the Agentic CAD workbench" ON)
+if(BUILD_AGENTIC)
+  add_subdirectory(Agentic)
+endif(BUILD_AGENTIC)
+
 if(BUILD_ADDONMGR)
   if( NOT EXISTS "${CMAKE_SOURCE_DIR}/src/Mod/AddonManager/CMakeLists.txt" )
     message(FATAL_ERROR "The Addon Manager has been moved into a git submodule. Please run
