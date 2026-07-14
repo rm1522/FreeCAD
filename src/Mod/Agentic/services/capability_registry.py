@@ -94,6 +94,21 @@ CAPABILITIES = (
         "mutates_document": True,
         "description": "Repeat the PartDesign body tip feature along a base axis (x, y, z) with bounded occurrences.",
     },
+    {
+        "name": "techdraw.create_page",
+        "mutates_document": True,
+        "description": "Create a TechDraw page for editable 2D manufacturing drawings.",
+    },
+    {
+        "name": "techdraw.add_view",
+        "mutates_document": True,
+        "description": "Add a projected TechDraw view of a source object to a TechDraw page.",
+    },
+    {
+        "name": "techdraw.add_dimension",
+        "mutates_document": True,
+        "description": "Add an edge-based TechDraw dimension to a projected view.",
+    },
 )
 
 

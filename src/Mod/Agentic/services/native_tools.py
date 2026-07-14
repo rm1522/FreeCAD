@@ -34,6 +34,8 @@ TARGET_REQUIRED_OPERATIONS = {
     "partdesign.chamfer",
     "partdesign.mirror",
     "partdesign.linear_pattern",
+    "techdraw.add_view",
+    "techdraw.add_dimension",
 }
 REVOLUTION_AXES = {"v_axis": "V_Axis", "h_axis": "H_Axis"}
 PATTERN_AXES = {"x": "X_Axis", "y": "Y_Axis", "z": "Z_Axis"}
@@ -52,6 +54,9 @@ CREATION_OPERATIONS = {
     "partdesign.chamfer",
     "partdesign.mirror",
     "partdesign.linear_pattern",
+    "techdraw.create_page",
+    "techdraw.add_view",
+    "techdraw.add_dimension",
 }
 SKETCH_PLANE_NORMALS = {
     "XY": (0.0, 0.0, 1.0),
@@ -73,6 +78,13 @@ SKETCH_CONSTRAINT_KINDS = (
     "angle",
     "symmetric",
 )
+TECHDRAW_DIMENSION_TYPES = ("Distance", "DistanceX", "DistanceY", "Radius", "Diameter")
+TECHDRAW_DIRECTIONS = {
+    "front": (0.0, 0.0, 1.0),
+    "top": (0.0, 1.0, 0.0),
+    "right": (1.0, 0.0, 0.0),
+    "isometric": (1.0, 1.0, 1.0),
+}
 
 
 def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -105,6 +117,8 @@ def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
             _validate_sketch_constraint_arguments(arguments)
         if operation_type.startswith("partdesign."):
             _validate_partdesign_arguments(operation_type, arguments)
+        if operation_type.startswith("techdraw."):
+            _validate_techdraw_arguments(operation_type, arguments)
         for key, value in arguments.items():
             if key == "translation_mm":
                 _validate_translation(value)
@@ -284,6 +298,11 @@ def _ensure_partdesign_registered() -> None:
             import PartDesign  # type: ignore  # noqa: F401
         except ImportError:
             return
+
+
+def _ensure_techdraw_registered() -> None:
+    """Load the TechDraw module so FreeCADCmd registers drawing object types."""
+    import TechDraw  # type: ignore  # noqa: F401
 
 
 def _create_sketch(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
@@ -643,6 +662,89 @@ def _create_linear_pattern(document: Any, operation: dict[str, Any], plan_id: st
     return feature
 
 
+def _create_techdraw_page(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    suffix = uuid.uuid4().hex[:8]
+    page = document.addObject("TechDraw::DrawPage", f"AgenticPage_{suffix}")
+    page.Label = arguments.get("label") or "Agentic Drawing Page"
+    if "scale" in arguments:
+        page.Scale = float(arguments["scale"])
+    _attach_agent_metadata(page, f"agentic-techdraw-page-{suffix}", plan_id)
+    return page
+
+
+def _techdraw_page_target(document: Any, stable_id: str) -> Any:
+    page = _find_target(document, stable_id)
+    if str(getattr(page, "TypeId", "")) != "TechDraw::DrawPage":
+        raise ValueError(f"Target is not a TechDraw page: {page.Label}")
+    return page
+
+
+def _techdraw_view_target(document: Any, stable_id: str) -> Any:
+    view = _find_target(document, stable_id)
+    if str(getattr(view, "TypeId", "")) != "TechDraw::DrawViewPart":
+        raise ValueError(f"Target is not a TechDraw projected view: {view.Label}")
+    return view
+
+
+def _techdraw_direction(value: Any) -> Any:
+    import FreeCAD  # type: ignore
+
+    if isinstance(value, str):
+        components = TECHDRAW_DIRECTIONS[value]
+    else:
+        components = value
+    return FreeCAD.Vector(float(components[0]), float(components[1]), float(components[2]))
+
+
+def _create_techdraw_view(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    page = _techdraw_page_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    source = _find_target(document, str(arguments["source_target"]))
+    if getattr(source, "Shape", None) is None or source.Shape.isNull():
+        raise ValueError(f"TechDraw view source has no measurable shape: {source.Label}")
+    suffix = uuid.uuid4().hex[:8]
+    view = document.addObject("TechDraw::DrawViewPart", f"AgenticView_{suffix}")
+    view.Label = arguments.get("label") or "Agentic Drawing View"
+    page.addView(view)
+    view.Source = [source]
+    view.Direction = _techdraw_direction(arguments.get("direction", "front"))
+    view.X = float(arguments.get("x_mm", 50.0))
+    view.Y = float(arguments.get("y_mm", 80.0))
+    if "scale" in arguments:
+        view.Scale = float(arguments["scale"])
+    _attach_agent_metadata(view, f"agentic-techdraw-view-{suffix}", plan_id)
+    return view
+
+
+def _find_page_for_techdraw_view(document: Any, view: Any) -> Any:
+    for candidate in document.Objects:
+        if str(getattr(candidate, "TypeId", "")) != "TechDraw::DrawPage":
+            continue
+        if view in (getattr(candidate, "Views", None) or []):
+            return candidate
+    raise ValueError(f"TechDraw view is not on a page: {view.Label}")
+
+
+def _create_techdraw_dimension(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    view = _techdraw_view_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    page_target = arguments.get("page_target")
+    page = _techdraw_page_target(document, str(page_target)) if page_target else _find_page_for_techdraw_view(document, view)
+    suffix = uuid.uuid4().hex[:8]
+    dimension = document.addObject("TechDraw::DrawViewDimension", f"AgenticDimension_{suffix}")
+    dimension.Label = arguments.get("label") or "Agentic Drawing Dimension"
+    page.addView(dimension)
+    dimension.Type = arguments.get("dimension_type", "Distance")
+    if "measure_type" in arguments:
+        dimension.MeasureType = arguments["measure_type"]
+    dimension.References2D = [(view, arguments.get("edge_name", "Edge1"))]
+    _attach_agent_metadata(dimension, f"agentic-techdraw-dimension-{suffix}", plan_id)
+    return dimension
+
+
 def _sketch_payload(obj: Any) -> dict[str, Any]:
     geometry = getattr(obj, "Geometry", None) or []
     constraints = getattr(obj, "Constraints", None) or []
@@ -665,11 +767,32 @@ def _is_body(obj: Any) -> bool:
     return str(getattr(obj, "TypeId", "")) == "PartDesign::Body"
 
 
+def _is_techdraw(obj: Any) -> bool:
+    return str(getattr(obj, "TypeId", "")).startswith("TechDraw::")
+
+
+def _techdraw_payload(obj: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"type_id": str(getattr(obj, "TypeId", ""))}
+    if payload["type_id"] == "TechDraw::DrawPage":
+        payload["view_count"] = len(getattr(obj, "Views", None) or [])
+    elif payload["type_id"] == "TechDraw::DrawViewPart":
+        payload["source_count"] = len(getattr(obj, "Source", None) or [])
+        payload["state"] = [str(item) for item in (getattr(obj, "State", None) or [])]
+    elif payload["type_id"] == "TechDraw::DrawViewDimension":
+        payload["dimension_type"] = str(getattr(obj, "Type", ""))
+        payload["reference_count"] = len(getattr(obj, "References2D", None) or [])
+        payload["state"] = [str(item) for item in (getattr(obj, "State", None) or [])]
+    return payload
+
+
 def _verify_objects(objects: list[Any]) -> list[dict[str, Any]]:
     evidence = []
     for obj in objects:
         if _is_body(obj):
             evidence.append({"object": _object_payload(obj), "checks": {"body_created": True}})
+            continue
+        if _is_techdraw(obj):
+            evidence.append({"object": _object_payload(obj), "checks": {"techdraw_object_created": True}, "techdraw": _techdraw_payload(obj)})
             continue
         if _is_sketch(obj):
             payload = _sketch_payload(obj)
@@ -821,6 +944,33 @@ def execute_plan(plan: dict[str, Any], *, approved: bool = False) -> dict[str, A
                         "diameter_mm": float(operation["arguments"]["diameter_mm"]),
                     }
                 )
+            elif operation_type == "techdraw.create_page":
+                obj = _create_techdraw_page(document, operation["arguments"], plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": "techdraw_page"})
+            elif operation_type == "techdraw.add_view":
+                obj = _create_techdraw_view(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "techdraw_view",
+                        "page": operation["target"],
+                        "source": operation["arguments"]["source_target"],
+                    }
+                )
+            elif operation_type == "techdraw.add_dimension":
+                obj = _create_techdraw_dimension(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "techdraw_dimension",
+                        "view": operation["target"],
+                        "dimension_type": operation["arguments"].get("dimension_type", "Distance"),
+                        "edge_name": operation["arguments"].get("edge_name", "Edge1"),
+                    }
+                )
             else:
                 raise ValueError(f"Operation cannot be mixed into a mutation plan: {operation_type}")
             alias = operation.get("alias")
@@ -886,7 +1036,12 @@ def _validate_operation_alias(
     alias declared by an earlier creation operation, so broken plans fail
     before any FreeCAD transaction opens.
     """
-    for reference in (operation.get("target"), arguments.get("body_target")):
+    for reference in (
+        operation.get("target"),
+        arguments.get("body_target"),
+        arguments.get("source_target"),
+        arguments.get("page_target"),
+    ):
         if isinstance(reference, str) and reference.startswith(ALIAS_REF_PREFIX):
             name = reference[len(ALIAS_REF_PREFIX) :]
             if name not in declared_aliases:
@@ -919,6 +1074,10 @@ def _resolve_operation_aliases(operation: dict[str, Any], plan_aliases: dict[str
         resolved["target"] = _resolve(resolved["target"])
     if "body_target" in resolved["arguments"]:
         resolved["arguments"]["body_target"] = _resolve(resolved["arguments"]["body_target"])
+    if "source_target" in resolved["arguments"]:
+        resolved["arguments"]["source_target"] = _resolve(resolved["arguments"]["source_target"])
+    if "page_target" in resolved["arguments"]:
+        resolved["arguments"]["page_target"] = _resolve(resolved["arguments"]["page_target"])
     return resolved
 
 
@@ -1069,3 +1228,45 @@ def _validate_partdesign_arguments(operation_type: str, arguments: dict[str, Any
         occurrences = arguments.get("occurrences")
         if not isinstance(occurrences, int) or isinstance(occurrences, bool) or not 2 <= occurrences <= MAX_PATTERN_OCCURRENCES:
             raise ValueError(f"occurrences must be an integer in [2, {MAX_PATTERN_OCCURRENCES}]")
+
+
+def _validate_techdraw_direction(value: Any) -> None:
+    if isinstance(value, str):
+        if value not in TECHDRAW_DIRECTIONS:
+            raise ValueError(f"TechDraw direction must be one of {sorted(TECHDRAW_DIRECTIONS)}")
+        return
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError("TechDraw direction must be a named direction or 3-element vector")
+    for component in value:
+        if not isinstance(component, (int, float)) or isinstance(component, bool) or not math.isfinite(float(component)):
+            raise ValueError("TechDraw direction vector components must be finite numbers")
+    if not any(float(component) != 0.0 for component in value):
+        raise ValueError("TechDraw direction vector must not be zero")
+
+
+def _validate_optional_positive_number(arguments: dict[str, Any], key: str) -> None:
+    if key not in arguments:
+        return
+    value = arguments.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value <= 0:
+        raise ValueError(f"{key} must be a positive finite number")
+
+
+def _validate_techdraw_arguments(operation_type: str, arguments: dict[str, Any]) -> None:
+    if operation_type == "techdraw.create_page":
+        _validate_optional_positive_number(arguments, "scale")
+    elif operation_type == "techdraw.add_view":
+        if not isinstance(arguments.get("source_target"), str) or not arguments["source_target"].strip():
+            raise ValueError("techdraw.add_view requires source_target")
+        _validate_techdraw_direction(arguments.get("direction", "front"))
+        _validate_optional_positive_number(arguments, "scale")
+    elif operation_type == "techdraw.add_dimension":
+        dimension_type = arguments.get("dimension_type", "Distance")
+        if dimension_type not in TECHDRAW_DIMENSION_TYPES:
+            raise ValueError(f"dimension_type must be one of {list(TECHDRAW_DIMENSION_TYPES)}")
+        edge_name = arguments.get("edge_name", "Edge1")
+        if not isinstance(edge_name, str) or not edge_name.startswith("Edge"):
+            raise ValueError("edge_name must be a TechDraw edge name such as Edge1")
+        page_target = arguments.get("page_target")
+        if page_target is not None and (not isinstance(page_target, str) or not page_target.strip()):
+            raise ValueError("page_target must be a non-empty string when provided")
