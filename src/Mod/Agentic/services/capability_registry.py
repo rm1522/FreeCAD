@@ -109,6 +109,26 @@ CAPABILITIES = (
         "mutates_document": True,
         "description": "Add an edge-based TechDraw dimension to a projected view.",
     },
+    {
+        "name": "techdraw.add_bom_table",
+        "mutates_document": True,
+        "description": "Add a BOM table to a TechDraw page from typed item rows.",
+    },
+    {
+        "name": "techdraw.add_balloon",
+        "mutates_document": True,
+        "description": "Add a TechDraw item balloon linked to a projected view.",
+    },
+    {
+        "name": "techdraw.add_section_view",
+        "mutates_document": True,
+        "description": "Add a TechDraw section view from an existing projected view.",
+    },
+    {
+        "name": "techdraw.add_detail_view",
+        "mutates_document": True,
+        "description": "Add a TechDraw detail view from an existing projected view.",
+    },
 )
 
 

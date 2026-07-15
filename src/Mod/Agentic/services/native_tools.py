@@ -37,6 +37,10 @@ TARGET_REQUIRED_OPERATIONS = {
     "partdesign.linear_pattern",
     "techdraw.add_view",
     "techdraw.add_dimension",
+    "techdraw.add_bom_table",
+    "techdraw.add_balloon",
+    "techdraw.add_section_view",
+    "techdraw.add_detail_view",
 }
 REVOLUTION_AXES = {"v_axis": "V_Axis", "h_axis": "H_Axis"}
 PATTERN_AXES = {"x": "X_Axis", "y": "Y_Axis", "z": "Z_Axis"}
@@ -58,6 +62,10 @@ CREATION_OPERATIONS = {
     "techdraw.create_page",
     "techdraw.add_view",
     "techdraw.add_dimension",
+    "techdraw.add_bom_table",
+    "techdraw.add_balloon",
+    "techdraw.add_section_view",
+    "techdraw.add_detail_view",
 }
 SKETCH_PLANE_NORMALS = {
     "XY": (0.0, 0.0, 1.0),
@@ -80,6 +88,7 @@ SKETCH_CONSTRAINT_KINDS = (
     "symmetric",
 )
 TECHDRAW_DIMENSION_TYPES = ("Distance", "DistanceX", "DistanceY", "Radius", "Diameter")
+MAX_TECHDRAW_BOM_ROWS = 256
 TECHDRAW_DIRECTIONS = {
     "front": (0.0, 0.0, 1.0),
     "top": (0.0, 1.0, 0.0),
@@ -123,6 +132,8 @@ def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
         for key, value in arguments.items():
             if key == "translation_mm":
                 _validate_translation(value)
+                continue
+            if key == "section_origin_mm":
                 continue
             if key == "plane_offset_mm":
                 if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or abs(float(value)) > MAX_SKETCH_COORDINATE_MM:
@@ -304,6 +315,11 @@ def _ensure_partdesign_registered() -> None:
 def _ensure_techdraw_registered() -> None:
     """Load the TechDraw module so FreeCADCmd registers drawing object types."""
     import TechDraw  # type: ignore  # noqa: F401
+
+
+def _ensure_spreadsheet_registered() -> None:
+    """Load the Spreadsheet module so FreeCADCmd registers Spreadsheet::Sheet."""
+    import Spreadsheet  # type: ignore  # noqa: F401
 
 
 def _create_sketch(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
@@ -776,6 +792,134 @@ def _create_techdraw_dimension(document: Any, operation: dict[str, Any], plan_id
     return dimension
 
 
+def _spreadsheet_cell(column_index: int, row_index: int) -> str:
+    column = ""
+    value = column_index
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        column = chr(65 + remainder) + column
+    return f"{column}{row_index}"
+
+
+def _set_spreadsheet_cell(sheet: Any, column_index: int, row_index: int, value: Any) -> None:
+    cell = _spreadsheet_cell(column_index, row_index)
+    setter = getattr(sheet, "set", None)
+    if callable(setter):
+        setter(cell, str(value))
+        return
+    cells = getattr(sheet, "Cells", None)
+    if cells is None:
+        cells = {}
+        setattr(sheet, "Cells", cells)
+    cells[cell] = str(value)
+
+
+def _create_techdraw_bom_table(document: Any, operation: dict[str, Any], plan_id: str) -> tuple[Any, Any]:
+    _ensure_techdraw_registered()
+    _ensure_spreadsheet_registered()
+    page = _techdraw_page_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    sheet = document.addObject("Spreadsheet::Sheet", f"AgenticBOM_{suffix}")
+    sheet.Label = arguments.get("label") or "Agentic BOM"
+    headers = ["Item", "Part No", "Description", "Qty"]
+    for column_index, header in enumerate(headers, start=1):
+        _set_spreadsheet_cell(sheet, column_index, 1, header)
+    for row_index, item in enumerate(arguments["items"], start=2):
+        _set_spreadsheet_cell(sheet, 1, row_index, item["item_no"])
+        _set_spreadsheet_cell(sheet, 2, row_index, item.get("part_no", ""))
+        _set_spreadsheet_cell(sheet, 3, row_index, item.get("description", ""))
+        _set_spreadsheet_cell(sheet, 4, row_index, item["quantity"])
+    recompute = getattr(sheet, "recompute", None)
+    if callable(recompute):
+        recompute()
+    view = document.addObject("TechDraw::DrawViewSpreadsheet", f"AgenticBOMView_{suffix}")
+    view.Label = arguments.get("view_label") or f"{sheet.Label} View"
+    page.addView(view)
+    view.Source = sheet
+    view.X = float(arguments.get("x_mm", 180.0))
+    view.Y = float(arguments.get("y_mm", 40.0))
+    _attach_agent_metadata(sheet, f"agentic-techdraw-bom-source-{suffix}", plan_id)
+    _attach_agent_metadata(view, f"agentic-techdraw-bom-table-{suffix}", plan_id)
+    return view, sheet
+
+
+def _create_techdraw_balloon(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    view = _techdraw_view_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    page_target = arguments.get("page_target")
+    page = _techdraw_page_target(document, str(page_target)) if page_target else _find_page_for_techdraw_view(document, view)
+    suffix = uuid.uuid4().hex[:8]
+    balloon = document.addObject("TechDraw::DrawViewBalloon", f"AgenticBalloon_{suffix}")
+    balloon.Label = arguments.get("label") or f"Balloon {arguments['item_no']}"
+    page.addView(balloon)
+    balloon.SourceView = view
+    balloon.Text = str(arguments["item_no"])
+    balloon.OriginX = float(arguments.get("origin_x_mm", arguments.get("x_mm", 0.0)))
+    balloon.OriginY = float(arguments.get("origin_y_mm", arguments.get("y_mm", 0.0)))
+    balloon.X = float(arguments.get("x_mm", 70.0))
+    balloon.Y = float(arguments.get("y_mm", 110.0))
+    if "bubble_shape" in arguments:
+        balloon.BubbleShape = arguments["bubble_shape"]
+    if "end_type" in arguments:
+        balloon.EndType = arguments["end_type"]
+    _attach_agent_metadata(balloon, f"agentic-techdraw-balloon-{suffix}", plan_id)
+    return balloon
+
+
+def _create_techdraw_section_view(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    base_view = _techdraw_view_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    page_target = arguments.get("page_target")
+    page = _techdraw_page_target(document, str(page_target)) if page_target else _find_page_for_techdraw_view(document, base_view)
+    source = getattr(base_view, "Source", None) or []
+    if not source:
+        raise ValueError(f"Section base view has no source: {base_view.Label}")
+    suffix = uuid.uuid4().hex[:8]
+    section = document.addObject("TechDraw::DrawViewSection", f"AgenticSection_{suffix}")
+    section.Label = arguments.get("label") or "Agentic Section View"
+    page.addView(section)
+    section.Source = list(source)
+    section.BaseView = base_view
+    section.Direction = _techdraw_direction(arguments.get("direction", "top"))
+    section.SectionNormal = _techdraw_direction(arguments.get("section_normal", arguments.get("direction", "top")))
+    section.SectionOrigin = tuple(float(value) for value in arguments["section_origin_mm"])
+    section.X = float(arguments.get("x_mm", 50.0))
+    section.Y = float(arguments.get("y_mm", 180.0))
+    if "scale" in arguments:
+        section.Scale = float(arguments["scale"])
+    _attach_agent_metadata(section, f"agentic-techdraw-section-{suffix}", plan_id)
+    return section
+
+
+def _create_techdraw_detail_view(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    base_view = _techdraw_view_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    page_target = arguments.get("page_target")
+    page = _techdraw_page_target(document, str(page_target)) if page_target else _find_page_for_techdraw_view(document, base_view)
+    suffix = uuid.uuid4().hex[:8]
+    detail = document.addObject("TechDraw::DrawViewDetail", f"AgenticDetail_{suffix}")
+    detail.Label = arguments.get("label") or "Agentic Detail View"
+    detail.BaseView = base_view
+    detail.Direction = getattr(base_view, "Direction", _techdraw_direction("front"))
+    if hasattr(base_view, "XDirection"):
+        detail.XDirection = base_view.XDirection
+    page.addView(detail)
+    detail.X = float(arguments.get("x_mm", 150.0))
+    detail.Y = float(arguments.get("y_mm", 180.0))
+    if "anchor_x_mm" in arguments:
+        detail.AnchorPoint = (float(arguments["anchor_x_mm"]), float(arguments.get("anchor_y_mm", 0.0)), 0.0)
+    if "radius_mm" in arguments:
+        detail.Radius = float(arguments["radius_mm"])
+    if "scale" in arguments:
+        detail.Scale = float(arguments["scale"])
+    _attach_agent_metadata(detail, f"agentic-techdraw-detail-{suffix}", plan_id)
+    return detail
+
+
 def _sketch_payload(obj: Any) -> dict[str, Any]:
     geometry = getattr(obj, "Geometry", None) or []
     constraints = getattr(obj, "Constraints", None) or []
@@ -802,6 +946,10 @@ def _is_techdraw(obj: Any) -> bool:
     return str(getattr(obj, "TypeId", "")).startswith("TechDraw::")
 
 
+def _is_spreadsheet(obj: Any) -> bool:
+    return str(getattr(obj, "TypeId", "")) == "Spreadsheet::Sheet"
+
+
 def _techdraw_payload(obj: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"type_id": str(getattr(obj, "TypeId", ""))}
     if payload["type_id"] == "TechDraw::DrawPage":
@@ -812,6 +960,18 @@ def _techdraw_payload(obj: Any) -> dict[str, Any]:
     elif payload["type_id"] == "TechDraw::DrawViewDimension":
         payload["dimension_type"] = str(getattr(obj, "Type", ""))
         payload["reference_count"] = len(getattr(obj, "References2D", None) or [])
+        payload["state"] = [str(item) for item in (getattr(obj, "State", None) or [])]
+    elif payload["type_id"] == "TechDraw::DrawViewSpreadsheet":
+        payload["has_source"] = getattr(obj, "Source", None) is not None
+    elif payload["type_id"] == "TechDraw::DrawViewBalloon":
+        payload["text"] = str(getattr(obj, "Text", ""))
+        payload["has_source_view"] = getattr(obj, "SourceView", None) is not None
+    elif payload["type_id"] == "TechDraw::DrawViewSection":
+        payload["has_base_view"] = getattr(obj, "BaseView", None) is not None
+        payload["source_count"] = len(getattr(obj, "Source", None) or [])
+        payload["state"] = [str(item) for item in (getattr(obj, "State", None) or [])]
+    elif payload["type_id"] == "TechDraw::DrawViewDetail":
+        payload["has_base_view"] = getattr(obj, "BaseView", None) is not None
         payload["state"] = [str(item) for item in (getattr(obj, "State", None) or [])]
     return payload
 
@@ -824,6 +984,10 @@ def _verify_objects(objects: list[Any]) -> list[dict[str, Any]]:
             continue
         if _is_techdraw(obj):
             evidence.append({"object": _object_payload(obj), "checks": {"techdraw_object_created": True}, "techdraw": _techdraw_payload(obj)})
+            continue
+        if _is_spreadsheet(obj):
+            cells = getattr(obj, "Cells", None) or {}
+            evidence.append({"object": _object_payload(obj), "checks": {"spreadsheet_created": True}, "spreadsheet": {"cell_count": len(cells)}})
             continue
         if _is_sketch(obj):
             payload = _sketch_payload(obj)
@@ -1000,6 +1164,50 @@ def execute_plan(plan: dict[str, Any], *, approved: bool = False) -> dict[str, A
                         "view": operation["target"],
                         "dimension_type": operation["arguments"].get("dimension_type", "Distance"),
                         "edge_name": operation["arguments"].get("edge_name", "Edge1"),
+                    }
+                )
+            elif operation_type == "techdraw.add_bom_table":
+                obj, sheet = _create_techdraw_bom_table(document, operation, plan["plan_id"])
+                changed_objects.append(sheet)
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "source_stable_id": sheet.AgenticStableId,
+                        "created": "techdraw_bom_table",
+                        "page": operation["target"],
+                        "row_count": len(operation["arguments"]["items"]),
+                    }
+                )
+            elif operation_type == "techdraw.add_balloon":
+                obj = _create_techdraw_balloon(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "techdraw_balloon",
+                        "view": operation["target"],
+                        "item_no": str(operation["arguments"]["item_no"]),
+                    }
+                )
+            elif operation_type == "techdraw.add_section_view":
+                obj = _create_techdraw_section_view(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "techdraw_section_view",
+                        "base_view": operation["target"],
+                    }
+                )
+            elif operation_type == "techdraw.add_detail_view":
+                obj = _create_techdraw_detail_view(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "techdraw_detail_view",
+                        "base_view": operation["target"],
                     }
                 )
             else:
@@ -1283,6 +1491,31 @@ def _validate_optional_positive_number(arguments: dict[str, Any], key: str) -> N
         raise ValueError(f"{key} must be a positive finite number")
 
 
+def _validate_techdraw_bom_items(arguments: dict[str, Any]) -> None:
+    items = arguments.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("techdraw.add_bom_table requires a non-empty items list")
+    if len(items) > MAX_TECHDRAW_BOM_ROWS:
+        raise ValueError(f"techdraw.add_bom_table supports at most {MAX_TECHDRAW_BOM_ROWS} rows")
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("BOM item entries must be objects")
+        item_no = item.get("item_no")
+        if not isinstance(item_no, (str, int)) or not str(item_no).strip():
+            raise ValueError("BOM item_no must be a non-empty string or integer")
+        item_key = str(item_no)
+        if item_key in seen:
+            raise ValueError(f"duplicate BOM item_no: {item_key}")
+        seen.add(item_key)
+        quantity = item.get("quantity")
+        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+            raise ValueError("BOM quantity must be a positive integer")
+        for optional_key in ("part_no", "description"):
+            if optional_key in item and not isinstance(item[optional_key], str):
+                raise ValueError(f"BOM {optional_key} must be a string")
+
+
 def _validate_techdraw_arguments(operation_type: str, arguments: dict[str, Any]) -> None:
     if operation_type == "techdraw.create_page":
         _validate_optional_positive_number(arguments, "scale")
@@ -1301,3 +1534,37 @@ def _validate_techdraw_arguments(operation_type: str, arguments: dict[str, Any])
         page_target = arguments.get("page_target")
         if page_target is not None and (not isinstance(page_target, str) or not page_target.strip()):
             raise ValueError("page_target must be a non-empty string when provided")
+    elif operation_type == "techdraw.add_bom_table":
+        _validate_techdraw_bom_items(arguments)
+    elif operation_type == "techdraw.add_balloon":
+        item_no = arguments.get("item_no")
+        if not isinstance(item_no, (str, int)) or not str(item_no).strip():
+            raise ValueError("techdraw.add_balloon requires item_no")
+        page_target = arguments.get("page_target")
+        if page_target is not None and (not isinstance(page_target, str) or not page_target.strip()):
+            raise ValueError("page_target must be a non-empty string when provided")
+        for key in ("x_mm", "y_mm", "origin_x_mm", "origin_y_mm"):
+            if key in arguments and (not isinstance(arguments[key], (int, float)) or isinstance(arguments[key], bool) or not math.isfinite(float(arguments[key]))):
+                raise ValueError(f"{key} must be a finite number")
+    elif operation_type == "techdraw.add_section_view":
+        origin = arguments.get("section_origin_mm")
+        if not isinstance(origin, list) or len(origin) != 3:
+            raise ValueError("techdraw.add_section_view requires section_origin_mm as a 3-vector")
+        for component in origin:
+            if not isinstance(component, (int, float)) or isinstance(component, bool) or not math.isfinite(float(component)):
+                raise ValueError("section_origin_mm components must be finite numbers")
+        _validate_techdraw_direction(arguments.get("direction", "top"))
+        _validate_techdraw_direction(arguments.get("section_normal", arguments.get("direction", "top")))
+        _validate_optional_positive_number(arguments, "scale")
+        page_target = arguments.get("page_target")
+        if page_target is not None and (not isinstance(page_target, str) or not page_target.strip()):
+            raise ValueError("page_target must be a non-empty string when provided")
+    elif operation_type == "techdraw.add_detail_view":
+        _validate_optional_positive_number(arguments, "scale")
+        _validate_optional_positive_number(arguments, "radius_mm")
+        page_target = arguments.get("page_target")
+        if page_target is not None and (not isinstance(page_target, str) or not page_target.strip()):
+            raise ValueError("page_target must be a non-empty string when provided")
+        for key in ("anchor_x_mm", "anchor_y_mm"):
+            if key in arguments and (not isinstance(arguments[key], (int, float)) or isinstance(arguments[key], bool) or not math.isfinite(float(arguments[key]))):
+                raise ValueError(f"{key} must be a finite number")
