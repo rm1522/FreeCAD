@@ -579,5 +579,6 @@ out/product_workspaces/media_8884e164a4c0/cad/disruptor_assembly_candidate/human
 - `document.undo`
 - `primitive.create_box`
 - `primitive.create_cylinder`
+- `bim.create_element`（IFC分類・根拠参照付きの編集可能なsemantic element）
 - `object.update_parameters`
 - `object.translate`

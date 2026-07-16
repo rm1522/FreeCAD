@@ -92,6 +92,31 @@ def _preview_operation(
                 f"objects {object_count_before} -> {object_count_before + 1}"
             ),
         }
+    if operation_type == "bim.create_element":
+        length = _float_or_none(arguments.get("length_mm"))
+        width = _float_or_none(arguments.get("width_mm"))
+        height = _float_or_none(arguments.get("height_mm"))
+        bbox = _bbox_or_none(length, width, height)
+        ifc_type = str(arguments.get("ifc_type") or "IfcBuildingElementProxy")
+        return {
+            "index": index,
+            "type": operation_type,
+            "title": f"Add {ifc_type} {arguments.get('label') or ''}".strip(),
+            "mutates_document": True,
+            "object_count_before": object_count_before,
+            "object_count_after": object_count_before + 1,
+            "before": f"objects={object_count_before}",
+            "after": (
+                f"objects={object_count_before + 1}, ifc_type={ifc_type}, "
+                f"bbox={_fmt_bbox(bbox)}, volume={_fmt_volume(_box_volume(bbox))}"
+            ),
+            "verify": "new object has valid shape, IFC classification, and source evidence refs after recompute",
+            "legacy": (
+                f"[diff] add {ifc_type} "
+                f"{_dims(arguments, ('length_mm', 'width_mm', 'height_mm'))}; "
+                f"objects {object_count_before} -> {object_count_before + 1}"
+            ),
+        }
     if operation_type == "primitive.create_cylinder":
         radius = _float_or_none(arguments.get("radius_mm"))
         height = _float_or_none(arguments.get("height_mm"))

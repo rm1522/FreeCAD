@@ -130,6 +130,7 @@ def _execute_service_plan(service_payload: dict[str, Any]) -> dict[str, Any]:
             "error": None,
             "tool_results": [],
             "verification": None,
+            "task_contract": service_payload.get("task_contract"),
             "trace_events": trace_events,
         }
     if status != "ready":
@@ -143,6 +144,7 @@ def _execute_service_plan(service_payload: dict[str, Any]) -> dict[str, Any]:
             "error": service_payload.get("error") or "agent_service_rejected",
             "tool_results": [],
             "verification": None,
+            "task_contract": service_payload.get("task_contract"),
             "trace_events": trace_events,
         }
     result = execute_plan(service_payload["plan"], approved=True)
@@ -156,6 +158,7 @@ def _execute_service_plan(service_payload: dict[str, Any]) -> dict[str, Any]:
         "error": None,
         "tool_results": [{"ok": True, "output": result, "error": None}],
         "verification": {"status": "pass", "summary": "all tool calls succeeded"},
+        "task_contract": service_payload.get("task_contract"),
         "trace_events": trace_events + [{"event": "agent_ipc_plan_executed"}],
     }
 

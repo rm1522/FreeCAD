@@ -25,6 +25,11 @@ CAPABILITIES = (
         "description": "Create a parametric Part workbench cylinder.",
     },
     {
+        "name": "bim.create_element",
+        "mutates_document": True,
+        "description": "Create editable geometry with explicit IFC type, predefined type, evidence, and stable identity properties.",
+    },
+    {
         "name": "object.update_parameters",
         "mutates_document": True,
         "description": "Update supported dimensions on an object identified by stable ID.",
@@ -128,6 +133,11 @@ CAPABILITIES = (
         "name": "techdraw.add_detail_view",
         "mutates_document": True,
         "description": "Add a TechDraw detail view from an existing projected view.",
+    },
+    {
+        "name": "techdraw.add_pmi_note",
+        "mutates_document": True,
+        "description": "Add a bounded TechDraw PMI/GD&T note or datum callout to a drawing page.",
     },
 )
 

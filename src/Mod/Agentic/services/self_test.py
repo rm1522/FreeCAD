@@ -10,6 +10,29 @@ from services.native_tools import get_document_context, requires_user_approval, 
 
 
 SCHEMA_VERSION = "agentic_cad_plugin_self_test.v1"
+REQUIRED_CAPABILITIES = frozenset(
+    {
+        "document.inspect",
+        "document.undo",
+        "primitive.create_box",
+        "primitive.create_cylinder",
+        "bim.create_element",
+        "object.update_parameters",
+        "object.translate",
+        "sketch.create",
+        "sketch.add_geometry",
+        "sketch.add_constraint",
+        "partdesign.create_body",
+        "partdesign.pad",
+        "partdesign.pocket",
+        "partdesign.revolution",
+        "partdesign.hole",
+        "partdesign.fillet",
+        "partdesign.chamfer",
+        "partdesign.mirror",
+        "partdesign.linear_pattern",
+    }
+)
 
 
 def _plan(operation_type: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -39,26 +62,7 @@ def run_self_test(*, include_document_context: bool = True) -> dict[str, Any]:
     checks = [
         {
             "name": "capabilities_present",
-            "passed": capability_names == {
-                "document.inspect",
-                "document.undo",
-                "primitive.create_box",
-                "primitive.create_cylinder",
-                "object.update_parameters",
-                "object.translate",
-                "sketch.create",
-                "sketch.add_geometry",
-                "sketch.add_constraint",
-                "partdesign.create_body",
-                "partdesign.pad",
-                "partdesign.pocket",
-                "partdesign.revolution",
-                "partdesign.hole",
-                "partdesign.fillet",
-                "partdesign.chamfer",
-                "partdesign.mirror",
-                "partdesign.linear_pattern",
-            },
+            "passed": REQUIRED_CAPABILITIES.issubset(capability_names),
         },
         {
             "name": "inspect_does_not_require_approval",

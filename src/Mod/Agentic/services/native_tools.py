@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import uuid
 from typing import Any
@@ -41,6 +42,7 @@ TARGET_REQUIRED_OPERATIONS = {
     "techdraw.add_balloon",
     "techdraw.add_section_view",
     "techdraw.add_detail_view",
+    "techdraw.add_pmi_note",
 }
 REVOLUTION_AXES = {"v_axis": "V_Axis", "h_axis": "H_Axis"}
 PATTERN_AXES = {"x": "X_Axis", "y": "Y_Axis", "z": "Z_Axis"}
@@ -49,6 +51,7 @@ ALIAS_REF_PREFIX = "@alias:"
 CREATION_OPERATIONS = {
     "primitive.create_box",
     "primitive.create_cylinder",
+    "bim.create_element",
     "sketch.create",
     "partdesign.create_body",
     "partdesign.pad",
@@ -66,6 +69,7 @@ CREATION_OPERATIONS = {
     "techdraw.add_balloon",
     "techdraw.add_section_view",
     "techdraw.add_detail_view",
+    "techdraw.add_pmi_note",
 }
 SKETCH_PLANE_NORMALS = {
     "XY": (0.0, 0.0, 1.0),
@@ -89,12 +93,15 @@ SKETCH_CONSTRAINT_KINDS = (
 )
 TECHDRAW_DIMENSION_TYPES = ("Distance", "DistanceX", "DistanceY", "Radius", "Diameter")
 MAX_TECHDRAW_BOM_ROWS = 256
+MAX_TECHDRAW_PMI_TEXT_LENGTH = 160
+TECHDRAW_PMI_NOTE_TYPES = ("datum", "feature_control_frame", "tolerance_note", "inspection_note")
 TECHDRAW_DIRECTIONS = {
     "front": (0.0, 0.0, 1.0),
     "top": (0.0, 1.0, 0.0),
     "right": (1.0, 0.0, 0.0),
     "isometric": (1.0, 1.0, 1.0),
 }
+MAX_IFC_TYPE_LENGTH = 80
 
 
 def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -127,6 +134,8 @@ def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
             _validate_sketch_constraint_arguments(arguments)
         if operation_type.startswith("partdesign."):
             _validate_partdesign_arguments(operation_type, arguments)
+        if operation_type == "bim.create_element":
+            _validate_bim_element_arguments(arguments)
         if operation_type.startswith("techdraw."):
             _validate_techdraw_arguments(operation_type, arguments)
         for key, value in arguments.items():
@@ -157,6 +166,18 @@ def requires_user_approval(plan: dict[str, Any]) -> bool:
     return any(operation["type"] in MUTATING_OPERATIONS for operation in validate_plan(plan))
 
 
+def _validate_bim_element_arguments(arguments: dict[str, Any]) -> None:
+    ifc_type = arguments.get("ifc_type")
+    if not isinstance(ifc_type, str) or not ifc_type.startswith("Ifc") or len(ifc_type) > MAX_IFC_TYPE_LENGTH:
+        raise ValueError("bim.create_element requires a bounded IFC entity name starting with Ifc")
+    predefined_type = arguments.get("predefined_type", "NOTDEFINED")
+    if not isinstance(predefined_type, str) or not predefined_type.strip() or len(predefined_type) > MAX_IFC_TYPE_LENGTH:
+        raise ValueError("bim.create_element predefined_type must be a bounded non-empty string")
+    evidence_refs = arguments.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        raise ValueError("bim.create_element requires source evidence refs")
+
+
 def _shape_payload(obj: Any) -> dict[str, Any] | None:
     shape = getattr(obj, "Shape", None)
     if shape is None or shape.isNull():
@@ -174,13 +195,20 @@ def _shape_payload(obj: Any) -> dict[str, Any] | None:
 
 def _object_payload(obj: Any) -> dict[str, Any]:
     stable_id = getattr(obj, "AgenticStableId", "")
-    return {
+    payload = {
         "name": obj.Name,
         "label": obj.Label,
         "type_id": obj.TypeId,
         "stable_id": stable_id or obj.Name,
         "shape": _shape_payload(obj),
     }
+    if hasattr(obj, "IfcType"):
+        payload["ifc_type"] = str(obj.IfcType)
+    if hasattr(obj, "PredefinedType"):
+        payload["predefined_type"] = str(obj.PredefinedType)
+    if hasattr(obj, "AgenticBIMKind"):
+        payload["bim_kind"] = str(obj.AgenticBIMKind)
+    return payload
 
 
 def get_document_context() -> dict[str, Any]:
@@ -228,6 +256,23 @@ def _attach_agent_metadata(obj: Any, stable_id: str, plan_id: str) -> None:
     obj.AgenticPlanId = plan_id
 
 
+def _attach_evidence_metadata(obj: Any, arguments: dict[str, Any]) -> None:
+    evidence_refs = arguments.get("evidence_refs")
+    if evidence_refs is not None:
+        if "AgenticEvidenceRefs" not in obj.PropertiesList:
+            obj.addProperty("App::PropertyString", "AgenticEvidenceRefs", "Agentic", "Source evidence references")
+        obj.AgenticEvidenceRefs = json.dumps(evidence_refs, ensure_ascii=False, sort_keys=True)
+    bim_kind = arguments.get("bim_kind")
+    if bim_kind:
+        if "AgenticBIMKind" not in obj.PropertiesList:
+            obj.addProperty("App::PropertyString", "AgenticBIMKind", "Agentic", "Evidence-derived BIM category")
+        obj.AgenticBIMKind = str(bim_kind)
+    if arguments.get("preview_only") is True:
+        if "AgenticPreviewOnly" not in obj.PropertiesList:
+            obj.addProperty("App::PropertyBool", "AgenticPreviewOnly", "Agentic", "Marks provisional preview geometry")
+        obj.AgenticPreviewOnly = True
+
+
 def _ensure_part_objects_registered() -> None:
     """Load the Part module so FreeCADCmd registers Part::Box/Cylinder types."""
     import Part  # type: ignore  # noqa: F401
@@ -241,7 +286,34 @@ def _create_box(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
     feature.Length = float(arguments["length_mm"])
     feature.Width = float(arguments["width_mm"])
     feature.Height = float(arguments["height_mm"])
-    _attach_agent_metadata(feature, f"agentic-box-{suffix}", plan_id)
+    _attach_agent_metadata(feature, str(arguments.get("stable_id") or f"agentic-box-{suffix}"), plan_id)
+    _attach_evidence_metadata(feature, arguments)
+    return feature
+
+
+def _create_bim_element(document: Any, arguments: dict[str, Any], plan_id: str) -> Any:
+    _ensure_part_objects_registered()
+    import Part  # type: ignore
+
+    suffix = uuid.uuid4().hex[:8]
+    feature = document.addObject("Part::Feature", f"AgenticBIMElement_{suffix}")
+    feature.Label = arguments.get("label") or "Agentic BIM Element"
+    feature.Shape = Part.makeBox(
+        float(arguments["length_mm"]),
+        float(arguments["width_mm"]),
+        float(arguments["height_mm"]),
+    )
+    feature.addProperty("App::PropertyString", "IfcType", "IFC", "IFC entity type")
+    feature.addProperty("App::PropertyString", "PredefinedType", "IFC", "IFC predefined type")
+    feature.addProperty("App::PropertyMap", "IfcProperties", "IFC", "Typed IFC property values")
+    feature.IfcType = str(arguments["ifc_type"])
+    feature.PredefinedType = str(arguments.get("predefined_type") or "NOTDEFINED")
+    feature.IfcProperties = {
+        "AgenticSource": "typed_bim_create_element",
+        "BIMKind": str(arguments.get("bim_kind") or "generic"),
+    }
+    _attach_agent_metadata(feature, str(arguments.get("stable_id") or f"agentic-bim-{suffix}"), plan_id)
+    _attach_evidence_metadata(feature, arguments)
     return feature
 
 
@@ -920,6 +992,45 @@ def _create_techdraw_detail_view(document: Any, operation: dict[str, Any], plan_
     return detail
 
 
+def _set_pmi_text(annotation: Any, text: str) -> None:
+    try:
+        annotation.Text = [text]
+    except Exception:
+        annotation.Text = text
+
+
+def _pmi_text(annotation: Any) -> str:
+    text = getattr(annotation, "Text", "")
+    if isinstance(text, (list, tuple)):
+        return "\n".join(str(item) for item in text)
+    return str(text)
+
+
+def _create_techdraw_pmi_note(document: Any, operation: dict[str, Any], plan_id: str) -> Any:
+    _ensure_techdraw_registered()
+    page = _techdraw_page_target(document, str(operation.get("target") or ""))
+    arguments = operation["arguments"]
+    suffix = uuid.uuid4().hex[:8]
+    annotation = document.addObject("TechDraw::DrawViewAnnotation", f"AgenticPMI_{suffix}")
+    annotation.Label = arguments.get("label") or "Agentic PMI Note"
+    page.addView(annotation)
+    _set_pmi_text(annotation, str(arguments["text"]))
+    annotation.X = float(arguments.get("x_mm", 120.0))
+    annotation.Y = float(arguments.get("y_mm", 40.0))
+    if "font_size_mm" in arguments:
+        try:
+            annotation.TextSize = float(arguments["font_size_mm"])
+        except Exception:
+            pass
+    if "source_view" in arguments:
+        try:
+            annotation.SourceView = _techdraw_view_target(document, str(arguments["source_view"]))
+        except Exception:
+            pass
+    _attach_agent_metadata(annotation, str(arguments.get("stable_id") or f"agentic-techdraw-pmi-{suffix}"), plan_id)
+    return annotation
+
+
 def _sketch_payload(obj: Any) -> dict[str, Any]:
     geometry = getattr(obj, "Geometry", None) or []
     constraints = getattr(obj, "Constraints", None) or []
@@ -973,6 +1084,9 @@ def _techdraw_payload(obj: Any) -> dict[str, Any]:
     elif payload["type_id"] == "TechDraw::DrawViewDetail":
         payload["has_base_view"] = getattr(obj, "BaseView", None) is not None
         payload["state"] = [str(item) for item in (getattr(obj, "State", None) or [])]
+    elif payload["type_id"] == "TechDraw::DrawViewAnnotation":
+        payload["text"] = _pmi_text(obj)
+        payload["has_text"] = bool(payload["text"].strip())
     return payload
 
 
@@ -1043,6 +1157,10 @@ def execute_plan(plan: dict[str, Any], *, approved: bool = False) -> dict[str, A
                 obj = _create_cylinder(document, operation["arguments"], plan["plan_id"])
                 changed_objects.append(obj)
                 changes.append({"stable_id": obj.AgenticStableId, "created": "cylinder"})
+            elif operation_type == "bim.create_element":
+                obj = _create_bim_element(document, operation["arguments"], plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append({"stable_id": obj.AgenticStableId, "created": "bim_element", "ifc_type": obj.IfcType})
             elif operation_type == "object.update_parameters":
                 obj, changed = _update_parameters(document, operation)
                 changed_objects.append(obj)
@@ -1210,6 +1328,17 @@ def execute_plan(plan: dict[str, Any], *, approved: bool = False) -> dict[str, A
                         "base_view": operation["target"],
                     }
                 )
+            elif operation_type == "techdraw.add_pmi_note":
+                obj = _create_techdraw_pmi_note(document, operation, plan["plan_id"])
+                changed_objects.append(obj)
+                changes.append(
+                    {
+                        "stable_id": obj.AgenticStableId,
+                        "created": "techdraw_pmi_note",
+                        "page": operation["target"],
+                        "pmi_note_type": operation["arguments"].get("note_type", "tolerance_note"),
+                    }
+                )
             else:
                 raise ValueError(f"Operation cannot be mixed into a mutation plan: {operation_type}")
             alias = operation.get("alias")
@@ -1315,6 +1444,8 @@ def _resolve_operation_aliases(operation: dict[str, Any], plan_aliases: dict[str
         resolved["arguments"]["body_target"] = _resolve(resolved["arguments"]["body_target"])
     if "source_target" in resolved["arguments"]:
         resolved["arguments"]["source_target"] = _resolve(resolved["arguments"]["source_target"])
+    if "source_view" in resolved["arguments"]:
+        resolved["arguments"]["source_view"] = _resolve(resolved["arguments"]["source_view"])
     if "page_target" in resolved["arguments"]:
         resolved["arguments"]["page_target"] = _resolve(resolved["arguments"]["page_target"])
     return resolved
@@ -1568,3 +1699,18 @@ def _validate_techdraw_arguments(operation_type: str, arguments: dict[str, Any])
         for key in ("anchor_x_mm", "anchor_y_mm"):
             if key in arguments and (not isinstance(arguments[key], (int, float)) or isinstance(arguments[key], bool) or not math.isfinite(float(arguments[key]))):
                 raise ValueError(f"{key} must be a finite number")
+    elif operation_type == "techdraw.add_pmi_note":
+        text = arguments.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("techdraw.add_pmi_note requires non-empty text")
+        if len(text) > MAX_TECHDRAW_PMI_TEXT_LENGTH:
+            raise ValueError(f"techdraw.add_pmi_note text is limited to {MAX_TECHDRAW_PMI_TEXT_LENGTH} characters")
+        note_type = arguments.get("note_type", "tolerance_note")
+        if note_type not in TECHDRAW_PMI_NOTE_TYPES:
+            raise ValueError(f"note_type must be one of {list(TECHDRAW_PMI_NOTE_TYPES)}")
+        for key in ("x_mm", "y_mm", "font_size_mm"):
+            if key in arguments and (not isinstance(arguments[key], (int, float)) or isinstance(arguments[key], bool) or not math.isfinite(float(arguments[key]))):
+                raise ValueError(f"{key} must be a finite number")
+        source_view = arguments.get("source_view")
+        if source_view is not None and (not isinstance(source_view, str) or not source_view.strip()):
+            raise ValueError("source_view must be a non-empty string when provided")
